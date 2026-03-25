@@ -1,0 +1,30 @@
+# Dependencies and build output
+node_modules/
+dist/
+build/
+.gradle/
+coverage/
+*.tsbuildinfo
+
+# Local environment and editor files
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+.DS_Store
+*.log
+
+# App-specific generated files
+apps/server/.gradle/
+apps/server/build/
+apps/web/node_modules/
+apps/web/dist/
+apps/web/vite.config.js
+apps/web/vite.config.d.ts
+apps/web/tailwind.config.js
+apps/web/tailwind.config.d.ts
+
+# Local HTTPS certificates
+infra/https/certs/*.pem
+!infra/https/certs/.gitkeep
