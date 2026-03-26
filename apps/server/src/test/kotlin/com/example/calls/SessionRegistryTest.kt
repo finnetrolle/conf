@@ -5,6 +5,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import java.time.Instant
 
@@ -15,9 +16,12 @@ class SessionRegistryTest {
         publicAppUrl = "http://localhost:3000",
         allowedOrigins = listOf("http://localhost:3000"),
         stunUrl = "stun:stun.l.google.com:19302",
-        turnUrl = "turn:localhost:3478?transport=udp",
-        turnUsername = "webrtc",
-        turnPassword = "webrtc-secret",
+        turnUrl = null,
+        turnPort = 3478,
+        turnTransport = "udp",
+        turnAuthSecret = "webrtc-secret",
+        turnCredentialTtl = java.time.Duration.ofMinutes(60),
+        signalingReconnectGrace = java.time.Duration.ofMillis(250),
         emptySessionGrace = java.time.Duration.ofSeconds(5),
         endedSessionRetention = java.time.Duration.ofSeconds(5),
         sessionMaxAge = java.time.Duration.ofHours(24),
@@ -44,6 +48,7 @@ class SessionRegistryTest {
         assertNotNull(sessionInfo)
         assertFalse(sessionInfo.canJoin)
         assertEquals("Join token is invalid for this session.", sessionInfo.message)
+        assertNull(sessionInfo.shareUrl)
     }
 
     @Test

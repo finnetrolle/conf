@@ -125,7 +125,6 @@ nano ~/conf/.env
 PUBLIC_APP_URL=https://callparents.ru
 ALLOWED_ORIGINS=https://callparents.ru,https://www.callparents.ru
 
-VITE_PUBLIC_APP_URL=
 VITE_API_BASE_URL=
 VITE_WS_BASE_URL=
 
@@ -134,9 +133,14 @@ WEB_PORT=3000
 TURN_PORT=3478
 
 STUN_URL=stun:stun.l.google.com:19302
-TURN_URL=turn:callparents.ru:3478?transport=udp
-TURN_USERNAME=webrtc
-TURN_PASSWORD=fead7ee26a6378167ed2eed695afa9deedb739150a55c5713c1f90f0ef50d809
+TURN_URL=
+TURN_TRANSPORT=udp
+TURN_AUTH_SECRET=fead7ee26a6378167ed2eed695afa9deedb739150a55c5713c1f90f0ef50d809
+TURN_CREDENTIAL_TTL_MINUTES=60
+TURN_REALM=callparents.ru
+TURN_MIN_PORT=49160
+TURN_MAX_PORT=49200
+TURN_EXTERNAL_IP=<IP_VPS>
 
 SESSION_EMPTY_GRACE_SECONDS=10
 SESSION_RETENTION_SECONDS=300
@@ -146,10 +150,11 @@ SESSION_MAX_AGE_HOURS=24
 Замечания:
 
 - `VITE_API_BASE_URL` и `VITE_WS_BASE_URL` можно оставить пустыми, потому что фронтенд умеет работать через same-origin.
+- `TURN_URL` можно оставить пустым: сервер соберет публичный TURN URL из `PUBLIC_APP_URL`, поэтому именно этот адрес должен быть каноническим.
 - `ALLOWED_ORIGINS` можно перечислять через запятую.
 - если не нужен `www`, убери его из `ALLOWED_ORIGINS`.
 
-### 7.2. Как сгенерировать `TURN_PASSWORD`
+### 7.2. Как сгенерировать `TURN_AUTH_SECRET`
 
 Лучше всего использовать hex-строку без спецсимволов:
 
@@ -237,7 +242,8 @@ listening-port=3478
 realm=callparents.ru
 fingerprint
 lt-cred-mech
-user=webrtc:fead7ee26a6378167ed2eed695afa9deedb739150a55c5713c1f90f0ef50d809
+use-auth-secret
+static-auth-secret=fead7ee26a6378167ed2eed695afa9deedb739150a55c5713c1f90f0ef50d809
 external-ip=<IP_VPS>
 no-cli
 no-tls
@@ -248,10 +254,10 @@ max-port=49200
 
 Важно:
 
-- пароль здесь должен совпадать с `TURN_PASSWORD` из `.env`;
+- `static-auth-secret` должен совпадать с `TURN_AUTH_SECRET` из `.env`;
 - `realm` должен быть реальным доменом;
 - `external-ip` обязателен для нормальной работы `TURN` за NAT/на VPS;
-- переменная `TURN_REALM` из `.env.example` в текущем коде не используется, поэтому `realm` надо менять вручную в `turnserver.conf`.
+- в `docker-compose.yml` из репозитория этот конфиг уже собирается из env автоматически, поэтому ручное редактирование `turnserver.conf` нужно только для bare-metal сценария.
 
 ### 7.5. `docker-compose.yml`
 
@@ -277,8 +283,10 @@ services:
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS}
       STUN_URL: ${STUN_URL}
       TURN_URL: ${TURN_URL}
-      TURN_USERNAME: ${TURN_USERNAME}
-      TURN_PASSWORD: ${TURN_PASSWORD}
+      TURN_PORT: ${TURN_PORT}
+      TURN_TRANSPORT: ${TURN_TRANSPORT}
+      TURN_AUTH_SECRET: ${TURN_AUTH_SECRET}
+      TURN_CREDENTIAL_TTL_MINUTES: ${TURN_CREDENTIAL_TTL_MINUTES:-60}
       SESSION_EMPTY_GRACE_SECONDS: ${SESSION_EMPTY_GRACE_SECONDS:-10}
       SESSION_RETENTION_SECONDS: ${SESSION_RETENTION_SECONDS:-300}
       SESSION_MAX_AGE_HOURS: ${SESSION_MAX_AGE_HOURS:-24}
@@ -292,7 +300,6 @@ services:
       context: ./apps/web
       dockerfile: Dockerfile
       args:
-        VITE_PUBLIC_APP_URL: ${VITE_PUBLIC_APP_URL:-}
         VITE_API_BASE_URL: ${VITE_API_BASE_URL:-}
         VITE_WS_BASE_URL: ${VITE_WS_BASE_URL:-}
     ports:
@@ -301,16 +308,39 @@ services:
       - server
 
   coturn:
-    image: coturn/coturn:latest
+    image: coturn/coturn@sha256:254a7e19f23366bc638af8e092c18ea52e0eefc9e44041f376e58b61b3b6d646
+    environment:
+      TURN_REALM: ${TURN_REALM:-callparents.ru}
+      TURN_AUTH_SECRET: ${TURN_AUTH_SECRET}
+      TURN_MIN_PORT: ${TURN_MIN_PORT:-49160}
+      TURN_MAX_PORT: ${TURN_MAX_PORT:-49200}
+      TURN_EXTERNAL_IP: ${TURN_EXTERNAL_IP}
     command:
-      - -c
-      - /etc/coturn/turnserver.conf
+      - /bin/sh
+      - -ec
+      - |
+        cat >/tmp/turnserver.conf <<EOF
+        listening-port=3478
+        realm=$${TURN_REALM}
+        fingerprint
+        lt-cred-mech
+        use-auth-secret
+        static-auth-secret=$${TURN_AUTH_SECRET}
+        no-cli
+        no-tls
+        no-dtls
+        min-port=$${TURN_MIN_PORT}
+        max-port=$${TURN_MAX_PORT}
+        log-file=stdout
+        EOF
+        if [ -n "$${TURN_EXTERNAL_IP}" ]; then
+          printf '%s\n' "external-ip=$${TURN_EXTERNAL_IP}" >> /tmp/turnserver.conf
+        fi
+        exec turnserver -c /tmp/turnserver.conf
     ports:
       - "${TURN_PORT:-3478}:3478"
       - "${TURN_PORT:-3478}:3478/udp"
       - "49160-49200:49160-49200/udp"
-    volumes:
-      - ./infra/coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
 ```
 
 Ключевой момент: если не пробросить `49160-49200/udp`, `TURN`-relay может не работать.
@@ -535,16 +565,18 @@ curl -6 -I http://callparents.ru
 
 Проверь по пунктам:
 
-1. В `.env` и `infra/coturn/turnserver.conf` совпадают `TURN_USERNAME` и `TURN_PASSWORD`.
+1. В `.env` и `infra/coturn/turnserver.conf` совпадают `TURN_AUTH_SECRET` и `TURN_REALM`, если ты настраивал bare-metal конфиг вручную.
 2. В `turnserver.conf` указан `external-ip=<IP_VPS>`.
 3. Открыты `3478/tcp`, `3478/udp`, `49160-49200/udp`.
-4. В `.env` `TURN_URL` указывает на реальный домен VPS:
+4. Если `TURN_URL` задан вручную, он указывает на реальный домен VPS:
 
 ```env
 TURN_URL=turn:callparents.ru:3478?transport=udp
 ```
 
-5. Контейнер `coturn` реально поднят:
+5. Если `TURN_URL` не задан, backend возьмет домен из `PUBLIC_APP_URL`, поэтому `PUBLIC_APP_URL` должен совпадать с публичным адресом, который видит пользователь.
+
+6. Контейнер `coturn` реально поднят:
 
 ```bash
 docker compose logs -f coturn
@@ -557,7 +589,7 @@ docker compose logs -f coturn
 3. Пользователь имеет доступ к Docker.
 4. В `.env` прописаны production-значения.
 5. `apps/web/nginx.conf` переведен на `listen 80`.
-6. `turnserver.conf` содержит реальный домен, пароль и `external-ip`.
+6. `turnserver.conf` содержит реальный домен, `TURN_AUTH_SECRET` и `external-ip`.
 7. `docker-compose.yml` пробрасывает `49160-49200/udp`.
 8. Контейнеры подняты через `docker compose up -d --build`.
 9. Системный `nginx` проксирует домен в `127.0.0.1:3000`.
@@ -568,7 +600,7 @@ docker compose logs -f coturn
 ## 15. Что можно улучшить позже
 
 - вынести production-конфиг `nginx` и `coturn` в отдельные файлы рядом с dev-конфигами;
-- параметризовать `realm` и `coturn user` через переменные окружения;
+- еще сильнее параметризовать production-конфиг `coturn` через переменные окружения;
 - добавить отдельный production `docker-compose.prod.yml`;
 - автоматизировать разворачивание через `Makefile`, `Ansible` или `Terraform`;
 - добавить healthchecks для `web`, `server` и `coturn`.

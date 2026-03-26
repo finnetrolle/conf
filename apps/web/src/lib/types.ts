@@ -1,6 +1,7 @@
 export type SessionStatus = "waiting_for_peer" | "connecting" | "active" | "ended" | "expired"
 export type ParticipantRole = "host" | "guest"
-export type ConnectionStage = "loading" | "preparing" | "waiting" | "connecting" | "connected" | "ended" | "failed"
+export type ConnectionStage = "loading" | "preparing" | "waiting" | "connecting" | "connected" | "reconnecting" | "ended" | "failed"
+export type ConnectionPath = "unknown" | "direct" | "relay"
 
 export interface CreateSessionResponse {
   sessionId: string
@@ -17,7 +18,7 @@ export interface SessionInfoResponse {
   canJoin: boolean
   activeParticipants: number
   maxParticipants: number
-  shareUrl: string
+  shareUrl: string | null
   message?: string | null
 }
 
@@ -40,4 +41,3 @@ export interface MediaState {
   audioEnabled: boolean
   videoEnabled: boolean
 }
-

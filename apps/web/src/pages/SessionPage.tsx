@@ -10,6 +10,7 @@ import { getIceServers, getSessionInfo, getWebSocketUrl, humanizeError } from "@
 import { cn, shortSessionId } from "@/lib/utils"
 import type {
   ConnectionStage,
+  ConnectionPath,
   IceServerConfig,
   MediaState,
   ParticipantRole,
@@ -32,6 +33,28 @@ type HtmlMediaElementWithSinkId = HTMLVideoElement & {
   setSinkId?: (sinkId: string) => Promise<void>
 }
 
+type ConnectionPathDetails = {
+  path: ConnectionPath
+  localCandidateType: string | null
+  remoteCandidateType: string | null
+}
+
+type TransportStatsWithSelectedPair = RTCStats & {
+  selectedCandidatePairId?: string
+}
+
+type CandidatePairStatsLike = RTCStats & {
+  localCandidateId?: string
+  remoteCandidateId?: string
+  nominated?: boolean
+  selected?: boolean
+  state?: string
+}
+
+type CandidateStatsLike = RTCStats & {
+  candidateType?: string
+}
+
 const defaultMediaState: MediaState = { audioEnabled: true, videoEnabled: true }
 
 const stageCopy: Record<ConnectionStage, { label: string; badge: "amber" | "blue" | "green" | "rose" | "slate" }> = {
@@ -40,8 +63,29 @@ const stageCopy: Record<ConnectionStage, { label: string; badge: "amber" | "blue
   waiting: { label: "Ждем второго участника", badge: "amber" },
   connecting: { label: "Соединяем браузеры", badge: "blue" },
   connected: { label: "Соединение активно", badge: "green" },
+  reconnecting: { label: "Восстанавливаем сигналинг", badge: "amber" },
   ended: { label: "Сессия завершена", badge: "slate" },
   failed: { label: "Нужно вмешательство", badge: "rose" },
+}
+
+const connectionPathCopy: Record<ConnectionPath, string> = {
+  unknown: "Маршрут не определен",
+  direct: "P2P direct",
+  relay: "TURN relay",
+}
+
+function extractTurnCredentialExpiry(iceServers: IceServerConfig[]) {
+  const expirationCandidates = iceServers
+    .filter((server) => server.urls.some((url) => url.startsWith("turn:")))
+    .map((server) => server.username?.split(":", 1)[0] ?? "")
+    .map((value) => Number.parseInt(value, 10))
+    .filter((value) => Number.isFinite(value) && value > 0)
+
+  if (expirationCandidates.length === 0) {
+    return null
+  }
+
+  return Math.min(...expirationCandidates) * 1_000
 }
 
 function isConstraintError(error: unknown) {
@@ -157,11 +201,14 @@ export function SessionPage() {
   const navigate = useNavigate()
   const { sessionId } = useParams<{ sessionId: string }>()
   const location = useLocation()
-  const joinToken = useMemo(() => new URLSearchParams(location.search).get("joinToken") ?? "", [location.search])
+  const searchParams = useMemo(() => new URLSearchParams(location.search), [location.search])
+  const joinToken = searchParams.get("joinToken") ?? ""
+  const iceTransportPolicy = searchParams.get("iceTransport") === "relay" ? "relay" : "all"
 
   const [sessionInfo, setSessionInfo] = useState<SessionInfoResponse | null>(null)
   const [connectionStage, setConnectionStage] = useState<ConnectionStage>("loading")
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
+  const [statusNote, setStatusNote] = useState<string | null>(null)
   const [copyLabel, setCopyLabel] = useState("Ссылка на сессию")
   const [devices, setDevices] = useState<DeviceLists>({ audioInputs: [], videoInputs: [], audioOutputs: [] })
   const [selectedVideoDeviceId, setSelectedVideoDeviceId] = useState("")
@@ -175,6 +222,7 @@ export function SessionPage() {
   const [isLocalPreviewVisible, setIsLocalPreviewVisible] = useState(true)
   const [isSettingsVisible, setIsSettingsVisible] = useState(false)
   const [mediaAccessIssue, setMediaAccessIssue] = useState<string | null>(null)
+  const [connectionPath, setConnectionPath] = useState<ConnectionPath>("unknown")
 
   const localVideoRef = useRef<HTMLVideoElement>(null)
   const remoteVideoRef = useRef<HTMLVideoElement>(null)
@@ -191,6 +239,13 @@ export function SessionPage() {
   const sessionInfoRef = useRef<SessionInfoResponse | null>(null)
   const iceServersRef = useRef<RTCIceServer[]>([])
   const leavingRef = useRef(false)
+  const connectionStageRef = useRef<ConnectionStage>("loading")
+  const reconnectTimeoutRef = useRef<number | null>(null)
+  const connectionPathTimeoutRef = useRef<number | null>(null)
+  const iceRefreshTimeoutRef = useRef<number | null>(null)
+  const reconnectAttemptRef = useRef(0)
+  const reconnectEnabledRef = useRef(true)
+  const turnCredentialExpiryRef = useRef<number | null>(null)
 
   function attachLocalStream(stream: MediaStream | null) {
     if (localVideoRef.current) {
@@ -201,6 +256,234 @@ export function SessionPage() {
   function attachRemoteStream(stream: MediaStream) {
     if (remoteVideoRef.current) {
       remoteVideoRef.current.srcObject = stream
+    }
+  }
+
+  function clearReconnectTimer() {
+    if (reconnectTimeoutRef.current !== null) {
+      window.clearTimeout(reconnectTimeoutRef.current)
+      reconnectTimeoutRef.current = null
+    }
+  }
+
+  function clearConnectionPathTimer() {
+    if (connectionPathTimeoutRef.current !== null) {
+      window.clearTimeout(connectionPathTimeoutRef.current)
+      connectionPathTimeoutRef.current = null
+    }
+  }
+
+  function clearIceRefreshTimer() {
+    if (iceRefreshTimeoutRef.current !== null) {
+      window.clearTimeout(iceRefreshTimeoutRef.current)
+      iceRefreshTimeoutRef.current = null
+    }
+  }
+
+  function hasReusablePeerConnection(peerConnection: RTCPeerConnection | null = peerConnectionRef.current) {
+    if (!peerConnection) {
+      return false
+    }
+
+    if (peerConnection.connectionState === "connected" || peerConnection.connectionState === "connecting") {
+      return true
+    }
+
+    if (peerConnection.iceConnectionState === "connected" || peerConnection.iceConnectionState === "completed") {
+      return true
+    }
+
+    return remoteStreamRef.current.getTracks().length > 0
+  }
+
+  function scheduleIceServerRefresh(currentSessionId: string, currentJoinToken: string, expiresAtMs: number | null) {
+    clearIceRefreshTimer()
+    turnCredentialExpiryRef.current = expiresAtMs
+
+    if (expiresAtMs === null) {
+      return
+    }
+
+    const remainingMs = expiresAtMs - Date.now()
+    const bufferMs = Math.min(60_000, Math.max(5_000, Math.floor(Math.max(remainingMs, 1_000) * 0.1)))
+    const delayMs = Math.max(1_000, remainingMs - bufferMs)
+
+    iceRefreshTimeoutRef.current = window.setTimeout(() => {
+      void refreshIceServersForSession(currentSessionId, currentJoinToken, "scheduled", true)
+    }, delayMs)
+  }
+
+  function applyIceServers(
+    nextIceServers: IceServerConfig[],
+    currentSessionId: string,
+    currentJoinToken: string,
+    reason: string,
+  ) {
+    const nextRtcIceServers = nextIceServers.map(toRtcIceServer)
+    iceServersRef.current = nextRtcIceServers
+    scheduleIceServerRefresh(currentSessionId, currentJoinToken, extractTurnCredentialExpiry(nextIceServers))
+
+    const peerConnection = peerConnectionRef.current
+    if (peerConnection) {
+      try {
+        peerConnection.setConfiguration({
+          ...peerConnection.getConfiguration(),
+          iceServers: nextRtcIceServers,
+        })
+      } catch (error) {
+        console.warn("Unable to refresh ICE server configuration on the current peer connection", { reason, error })
+      }
+    }
+  }
+
+  async function refreshIceServersForSession(
+    currentSessionId: string,
+    currentJoinToken: string,
+    reason: string,
+    failSilently = false,
+  ) {
+    try {
+      const iceServers = await getIceServers(currentSessionId, currentJoinToken)
+      if (leavingRef.current) {
+        return
+      }
+
+      applyIceServers(iceServers.iceServers, currentSessionId, currentJoinToken, reason)
+      console.info("Refreshed ICE server configuration", {
+        reason,
+        turnEnabled: iceServers.iceServers.some((server) => server.urls.some((url) => url.startsWith("turn:"))),
+      })
+    } catch (error) {
+      console.warn("Unable to refresh ICE server configuration", { reason, error })
+      if (failSilently && !leavingRef.current) {
+        clearIceRefreshTimer()
+        iceRefreshTimeoutRef.current = window.setTimeout(() => {
+          void refreshIceServersForSession(currentSessionId, currentJoinToken, `${reason}-retry`, true)
+        }, 10_000)
+        return
+      }
+
+      throw error
+    }
+  }
+
+  async function ensureFreshIceServers(currentSessionId: string, currentJoinToken: string, reason: string) {
+    const expiresAtMs = turnCredentialExpiryRef.current
+    if (expiresAtMs === null) {
+      return
+    }
+
+    if (expiresAtMs - Date.now() > 60_000) {
+      return
+    }
+
+    await refreshIceServersForSession(currentSessionId, currentJoinToken, `${reason}-preemptive-refresh`)
+  }
+
+  async function describeConnectionPath(peerConnection: RTCPeerConnection): Promise<ConnectionPathDetails> {
+    const stats = await peerConnection.getStats()
+    let selectedPair: RTCStats | null = null
+
+    stats.forEach((report) => {
+      if (selectedPair || report.type !== "transport") {
+        return
+      }
+
+      const transport = report as TransportStatsWithSelectedPair
+      if (transport.selectedCandidatePairId) {
+        selectedPair = stats.get(transport.selectedCandidatePairId) ?? null
+      }
+    })
+
+    stats.forEach((report) => {
+      if (selectedPair || report.type !== "candidate-pair") {
+        return
+      }
+
+      const pair = report as CandidatePairStatsLike
+      if (pair.selected || (pair.state === "succeeded" && pair.nominated)) {
+        selectedPair = report
+      }
+    })
+
+    if (!selectedPair) {
+      return { path: "unknown", localCandidateType: null, remoteCandidateType: null }
+    }
+
+    const pair = selectedPair as CandidatePairStatsLike
+    if (!pair.localCandidateId && !pair.remoteCandidateId) {
+      return { path: "unknown", localCandidateType: null, remoteCandidateType: null }
+    }
+    const localCandidate = pair.localCandidateId ? (stats.get(pair.localCandidateId) as CandidateStatsLike | undefined) : undefined
+    const remoteCandidate = pair.remoteCandidateId ? (stats.get(pair.remoteCandidateId) as CandidateStatsLike | undefined) : undefined
+    const localCandidateType = localCandidate?.candidateType ?? null
+    const remoteCandidateType = remoteCandidate?.candidateType ?? null
+    const path: ConnectionPath =
+      localCandidateType === "relay" || remoteCandidateType === "relay"
+        ? "relay"
+        : localCandidateType || remoteCandidateType
+          ? "direct"
+          : "unknown"
+
+    return {
+      path,
+      localCandidateType,
+      remoteCandidateType,
+    }
+  }
+
+  async function inspectConnectionPath(peerConnection: RTCPeerConnection, reason: string, attempt = 0) {
+    try {
+      const details = await describeConnectionPath(peerConnection)
+      if (peerConnection !== peerConnectionRef.current) {
+        return
+      }
+
+      if (details.path === "unknown") {
+        const isConnected =
+          peerConnection.connectionState === "connected" ||
+          peerConnection.iceConnectionState === "connected" ||
+          peerConnection.iceConnectionState === "completed"
+
+        if (iceTransportPolicy === "relay" && isConnected) {
+          setConnectionPath("relay")
+          console.info("Marked WebRTC connection path as relay due to relay-only policy", {
+            reason,
+            attempt,
+            connectionState: peerConnection.connectionState,
+            iceConnectionState: peerConnection.iceConnectionState,
+          })
+          return
+        }
+
+        if (attempt < 4) {
+          clearConnectionPathTimer()
+          connectionPathTimeoutRef.current = window.setTimeout(() => {
+            void inspectConnectionPath(peerConnection, `${reason}-retry`, attempt + 1)
+          }, 750 * (attempt + 1))
+          return
+        }
+      }
+
+      clearConnectionPathTimer()
+      setConnectionPath(details.path)
+      console.info("Resolved WebRTC connection path", {
+        reason,
+        path: details.path,
+        localCandidateType: details.localCandidateType,
+        remoteCandidateType: details.remoteCandidateType,
+        connectionState: peerConnection.connectionState,
+        iceConnectionState: peerConnection.iceConnectionState,
+        iceTransportPolicy,
+      })
+    } catch (error) {
+      console.warn("Unable to inspect WebRTC candidate pair", error)
+      if (peerConnection === peerConnectionRef.current && attempt < 4) {
+        clearConnectionPathTimer()
+        connectionPathTimeoutRef.current = window.setTimeout(() => {
+          void inspectConnectionPath(peerConnection, `${reason}-retry`, attempt + 1)
+        }, 750 * (attempt + 1))
+      }
     }
   }
 
@@ -283,11 +566,7 @@ export function SessionPage() {
       return
     }
 
-    try {
-      await videoElement.setSinkId(deviceId)
-    } catch (error) {
-      setErrorMessage(humanizeError(error))
-    }
+    await videoElement.setSinkId(deviceId)
   }
 
   async function replaceTracks(previousStream: MediaStream | null, nextStream: MediaStream) {
@@ -448,6 +727,8 @@ export function SessionPage() {
     attachRemoteStream(remoteStreamRef.current)
     setRemoteConnected(false)
     setRemoteMediaState(defaultMediaState)
+    setConnectionPath("unknown")
+    clearConnectionPathTimer()
   }
 
   async function resetPeerConnection(clearRemote = true) {
@@ -462,6 +743,8 @@ export function SessionPage() {
     }
 
     pendingCandidatesRef.current = []
+    setConnectionPath("unknown")
+    clearConnectionPathTimer()
 
     if (clearRemote) {
       clearRemoteStream()
@@ -475,6 +758,7 @@ export function SessionPage() {
 
     const peerConnection = new RTCPeerConnection({
       iceServers: iceServersRef.current,
+      iceTransportPolicy,
     })
 
     remoteStreamRef.current = new MediaStream()
@@ -482,6 +766,7 @@ export function SessionPage() {
 
     peerConnection.onicecandidate = (event) => {
       if (event.candidate) {
+        console.debug("Sending ICE candidate", { candidate: event.candidate.toJSON().candidate })
         sendSocketMessage("webrtc.ice_candidate", {
           candidate: event.candidate.toJSON(),
         })
@@ -499,9 +784,23 @@ export function SessionPage() {
       attachRemoteStream(remoteStreamRef.current)
       setRemoteConnected(true)
       setConnectionStage("connected")
+      if (iceTransportPolicy === "relay") {
+        clearConnectionPathTimer()
+        setConnectionPath("relay")
+        console.info("Marked WebRTC connection path as relay after remote track attachment", {
+          iceTransportPolicy,
+          trackCount: remoteStreamRef.current.getTracks().length,
+        })
+      } else {
+        void inspectConnectionPath(peerConnection, "track-attached")
+      }
     }
 
     peerConnection.onconnectionstatechange = () => {
+      console.info("Peer connection state changed", {
+        connectionState: peerConnection.connectionState,
+        iceConnectionState: peerConnection.iceConnectionState,
+      })
       switch (peerConnection.connectionState) {
         case "connecting":
           setConnectionStage("connecting")
@@ -509,17 +808,32 @@ export function SessionPage() {
         case "connected":
           setConnectionStage("connected")
           setRemoteConnected(true)
+          setStatusNote(null)
+          setErrorMessage(null)
+          void inspectConnectionPath(peerConnection, "connectionstate-connected")
           break
         case "disconnected":
           setConnectionStage("connecting")
           setRemoteConnected(false)
+          setStatusNote("Медиа-соединение просело. Пробуем вернуть аудио и видео без перезагрузки страницы.")
           break
         case "failed":
           setConnectionStage("failed")
+          setStatusNote(null)
           setErrorMessage("WebRTC-соединение не удалось стабилизировать. Попробуйте открыть ссылку заново.")
           break
         default:
           break
+      }
+    }
+
+    peerConnection.oniceconnectionstatechange = () => {
+      console.info("ICE connection state changed", {
+        iceConnectionState: peerConnection.iceConnectionState,
+        connectionState: peerConnection.connectionState,
+      })
+      if (peerConnection.iceConnectionState === "connected" || peerConnection.iceConnectionState === "completed") {
+        void inspectConnectionPath(peerConnection, `ice-${peerConnection.iceConnectionState}`)
       }
     }
 
@@ -546,11 +860,19 @@ export function SessionPage() {
   }
 
   async function createOffer() {
+    if (sessionId && joinToken) {
+      await ensureFreshIceServers(sessionId, joinToken, "create-offer")
+    }
+
     const peerConnection = await ensurePeerConnection()
     if (peerConnection.signalingState !== "stable") {
       return
     }
 
+    console.info("Creating WebRTC offer", {
+      role: roleRef.current,
+      iceTransportPolicy,
+    })
     setConnectionStage("connecting")
     const offer = await peerConnection.createOffer()
     await peerConnection.setLocalDescription(offer)
@@ -558,6 +880,10 @@ export function SessionPage() {
   }
 
   async function handleIncomingOffer(payload: Record<string, unknown>) {
+    if (sessionId && joinToken) {
+      await ensureFreshIceServers(sessionId, joinToken, "incoming-offer")
+    }
+
     await resetPeerConnection(false)
     const peerConnection = await ensurePeerConnection()
     setConnectionStage("connecting")
@@ -599,19 +925,55 @@ export function SessionPage() {
 
   async function handleServerMessage(rawEvent: MessageEvent<string>) {
     const message = JSON.parse(rawEvent.data) as WsMessage<Record<string, unknown>>
+    console.info("Received signaling event", { type: message.type })
 
     switch (message.type) {
       case "session.ready": {
+        reconnectEnabledRef.current = true
+        reconnectAttemptRef.current = 0
+        clearReconnectTimer()
         const nextRole = String(message.payload.role) as ParticipantRole
+        const resumed = Boolean(message.payload.resumed)
         roleRef.current = nextRole
         setRole(nextRole)
-        const shouldCreateOffer = Boolean(message.payload.shouldCreateOffer)
         const peerPresent = Boolean(message.payload.peerPresent)
+        const shouldCreateOffer = Boolean(message.payload.shouldCreateOffer)
+        const canReusePeerConnection = hasReusablePeerConnection()
+        setErrorMessage(null)
+        setStatusNote(null)
+
+        if (resumed && peerPresent && canReusePeerConnection) {
+          setRemoteConnected(
+            remoteStreamRef.current.getTracks().length > 0 || peerConnectionRef.current?.connectionState === "connected",
+          )
+          setConnectionStage("connected")
+          const peerConnection = peerConnectionRef.current
+          if (peerConnection) {
+            if (iceTransportPolicy === "relay") {
+              setConnectionPath("relay")
+            } else {
+              void inspectConnectionPath(peerConnection, "signaling-resumed")
+            }
+          }
+          break
+        }
 
         if (peerPresent) {
-          setConnectionStage(shouldCreateOffer ? "connecting" : "waiting")
+          setConnectionStage("connecting")
         } else {
           setConnectionStage("waiting")
+        }
+
+        if (peerPresent && nextRole === "host" && !canReusePeerConnection && resumed) {
+          await resetPeerConnection(true)
+          await createOffer()
+          break
+        }
+
+        if (peerPresent && nextRole === "guest" && !canReusePeerConnection && resumed) {
+          await resetPeerConnection(true)
+          sendSocketMessage("webrtc.restart_ice", {})
+          break
         }
 
         if (shouldCreateOffer) {
@@ -620,6 +982,7 @@ export function SessionPage() {
         break
       }
       case "participant.joined": {
+        setStatusNote(null)
         setConnectionStage("connecting")
         if (roleRef.current === "host") {
           await resetPeerConnection(true)
@@ -629,12 +992,9 @@ export function SessionPage() {
       }
       case "participant.left": {
         await resetPeerConnection(true)
+        setErrorMessage(null)
+        setStatusNote("Собеседник вышел из звонка. Сессия остается открытой, можно дождаться повторного входа по той же ссылке.")
         setConnectionStage("waiting")
-        break
-      }
-      case "session.ended": {
-        await resetPeerConnection(true)
-        setConnectionStage("ended")
         break
       }
       case "webrtc.offer": {
@@ -649,6 +1009,13 @@ export function SessionPage() {
         await handleIncomingCandidate(message.payload)
         break
       }
+      case "webrtc.restart_ice": {
+        if (roleRef.current === "host") {
+          await resetPeerConnection(true)
+          await createOffer()
+        }
+        break
+      }
       case "media.state_changed": {
         setRemoteMediaState({
           audioEnabled: Boolean(message.payload.audioEnabled),
@@ -657,9 +1024,12 @@ export function SessionPage() {
         break
       }
       case "error": {
+        const code = typeof message.payload.code === "string" ? message.payload.code : "unknown_error"
         const messageText = typeof message.payload.message === "string" ? message.payload.message : "Не удалось обработать signaling-событие."
+        reconnectEnabledRef.current = !["invalid_join_token", "session_not_found", "session_full", "session_ended"].includes(code)
+        setStatusNote(null)
         setErrorMessage(messageText)
-        setConnectionStage("failed")
+        setConnectionStage(code === "session_ended" ? "ended" : "failed")
         break
       }
       default:
@@ -667,12 +1037,46 @@ export function SessionPage() {
     }
   }
 
-  function openWebSocket(currentSessionId: string, currentJoinToken: string) {
+  function scheduleSocketReconnect(currentSessionId: string, currentJoinToken: string) {
+    if (leavingRef.current || !reconnectEnabledRef.current) {
+      return
+    }
+
+    clearReconnectTimer()
+    const nextAttempt = reconnectAttemptRef.current + 1
+    reconnectAttemptRef.current = nextAttempt
+
+    if (nextAttempt > 3) {
+      setStatusNote(null)
+      setConnectionStage("failed")
+      setErrorMessage("Сигналинг не удалось восстановить после нескольких попыток. Открой ссылку заново.")
+      return
+    }
+
+    const delayMs = Math.min(1_000 * nextAttempt, 4_000)
+    setErrorMessage(null)
+    setStatusNote(`Сигналинг временно потерян. Пробуем переподключиться (${nextAttempt}/3).`)
+    setConnectionStage("reconnecting")
+    console.warn("Scheduling signaling reconnect", { attempt: nextAttempt, delayMs })
+
+    reconnectTimeoutRef.current = window.setTimeout(() => {
+      openWebSocket(currentSessionId, currentJoinToken, true)
+    }, delayMs)
+  }
+
+  function openWebSocket(currentSessionId: string, currentJoinToken: string, isReconnect = false) {
+    reconnectEnabledRef.current = true
+    clearReconnectTimer()
+    console.info("Opening signaling socket", { isReconnect })
     const socket = new WebSocket(getWebSocketUrl())
     webSocketRef.current = socket
 
     socket.onopen = () => {
-      sendSocketMessage("session.join", {
+      console.info("Signaling socket open", { isReconnect })
+      if (isReconnect) {
+        setStatusNote("Сигналинг восстановлен. Синхронизируем состояние звонка.")
+      }
+      sendSocketMessage(isReconnect ? "session.resume" : "session.join", {
         sessionId: currentSessionId,
         joinToken: currentJoinToken,
       })
@@ -682,15 +1086,22 @@ export function SessionPage() {
       void handleServerMessage(event)
     }
 
-    socket.onclose = () => {
-      if (!leavingRef.current && connectionStage !== "ended") {
-        setConnectionStage((current) => (current === "connected" ? "connecting" : current))
+    socket.onclose = (event) => {
+      console.info("Signaling socket closed", {
+        code: event.code,
+        reason: event.reason,
+        wasClean: event.wasClean,
+      })
+      if (webSocketRef.current === socket) {
+        webSocketRef.current = null
+      }
+      if (!leavingRef.current && connectionStageRef.current !== "ended") {
+        scheduleSocketReconnect(currentSessionId, currentJoinToken)
       }
     }
 
     socket.onerror = () => {
-      setConnectionStage("failed")
-      setErrorMessage("Сигналинг-сокет оборвался. Попробуйте открыть ссылку заново.")
+      console.warn("Signaling socket error")
     }
   }
 
@@ -703,9 +1114,7 @@ export function SessionPage() {
       return
     }
 
-    const parsedShareUrl = new URL(sessionInfoRef.current.shareUrl, window.location.origin)
-    const shareUrl = `${window.location.origin}${parsedShareUrl.pathname}${parsedShareUrl.search}`
-    await navigator.clipboard.writeText(shareUrl)
+    await navigator.clipboard.writeText(sessionInfoRef.current.shareUrl)
     setCopyLabel("Ссылка скопирована")
     window.setTimeout(() => setCopyLabel("Ссылка на сессию"), 1600)
   }
@@ -739,28 +1148,58 @@ export function SessionPage() {
   }
 
   async function handleVideoDeviceChange(event: ChangeEvent<HTMLSelectElement>) {
+    const previousDeviceId = selectedVideoDeviceIdRef.current
     const nextDeviceId = event.target.value
     selectedVideoDeviceIdRef.current = nextDeviceId
     setSelectedVideoDeviceId(nextDeviceId)
-    await initializeLocalMedia(nextDeviceId, selectedAudioDeviceIdRef.current)
+
+    try {
+      setErrorMessage(null)
+      await initializeLocalMedia(nextDeviceId, selectedAudioDeviceIdRef.current)
+    } catch (error) {
+      selectedVideoDeviceIdRef.current = previousDeviceId
+      setSelectedVideoDeviceId(previousDeviceId)
+      setErrorMessage(humanizeError(error))
+    }
   }
 
   async function handleAudioDeviceChange(event: ChangeEvent<HTMLSelectElement>) {
+    const previousDeviceId = selectedAudioDeviceIdRef.current
     const nextDeviceId = event.target.value
     selectedAudioDeviceIdRef.current = nextDeviceId
     setSelectedAudioDeviceId(nextDeviceId)
-    await initializeLocalMedia(selectedVideoDeviceIdRef.current, nextDeviceId)
+
+    try {
+      setErrorMessage(null)
+      await initializeLocalMedia(selectedVideoDeviceIdRef.current, nextDeviceId)
+    } catch (error) {
+      selectedAudioDeviceIdRef.current = previousDeviceId
+      setSelectedAudioDeviceId(previousDeviceId)
+      setErrorMessage(humanizeError(error))
+    }
   }
 
   async function handleAudioOutputChange(event: ChangeEvent<HTMLSelectElement>) {
+    const previousDeviceId = selectedAudioOutputIdRef.current
     const nextDeviceId = event.target.value
     selectedAudioOutputIdRef.current = nextDeviceId
     setSelectedAudioOutputId(nextDeviceId)
-    await applyAudioOutputDevice(nextDeviceId)
+
+    try {
+      setErrorMessage(null)
+      await applyAudioOutputDevice(nextDeviceId)
+    } catch (error) {
+      selectedAudioOutputIdRef.current = previousDeviceId
+      setSelectedAudioOutputId(previousDeviceId)
+      setErrorMessage(humanizeError(error))
+    }
   }
 
   async function cleanupSession() {
     leavingRef.current = true
+    reconnectEnabledRef.current = false
+    clearReconnectTimer()
+    clearConnectionPathTimer()
     sendSocketMessage("session.leave", { sessionId })
     webSocketRef.current?.close()
     webSocketRef.current = null
@@ -768,6 +1207,9 @@ export function SessionPage() {
     localStreamRef.current?.getTracks().forEach((track) => track.stop())
     localStreamRef.current = null
     attachLocalStream(null)
+    setConnectionPath("unknown")
+    clearIceRefreshTimer()
+    turnCredentialExpiryRef.current = null
   }
 
   async function handleLeaveSession() {
@@ -780,6 +1222,10 @@ export function SessionPage() {
   }, [])
 
   useEffect(() => {
+    connectionStageRef.current = connectionStage
+  }, [connectionStage])
+
+  useEffect(() => {
     let cancelled = false
 
     async function bootstrap() {
@@ -790,20 +1236,29 @@ export function SessionPage() {
       }
 
       try {
-        const [session, iceServers] = await Promise.all([getSessionInfo(sessionId, joinToken), getIceServers()])
+        const session = await getSessionInfo(sessionId, joinToken)
         if (cancelled) {
           return
         }
 
+        leavingRef.current = false
+        reconnectEnabledRef.current = true
+        reconnectAttemptRef.current = 0
+        clearReconnectTimer()
         sessionInfoRef.current = session
         setSessionInfo(session)
         setRole(session.role)
         roleRef.current = session.role
-        iceServersRef.current = iceServers.iceServers.map(toRtcIceServer)
 
         if (!session.canJoin || !session.role) {
+          setStatusNote(null)
           setConnectionStage(session.status === "ended" || session.status === "expired" ? "ended" : "failed")
           setErrorMessage(session.message ?? "Сессия недоступна для подключения.")
+          return
+        }
+
+        await refreshIceServersForSession(sessionId, joinToken, "bootstrap")
+        if (cancelled) {
           return
         }
 
@@ -824,10 +1279,16 @@ export function SessionPage() {
           }
         }
 
+        if (iceTransportPolicy === "relay") {
+          setStatusNote("Включен relay-only режим: браузер будет использовать только TURN для диагностики сетевого пути.")
+        } else {
+          setStatusNote(null)
+        }
         setConnectionStage("preparing")
         openWebSocket(sessionId, joinToken)
       } catch (error) {
         if (!cancelled) {
+          setStatusNote(null)
           setConnectionStage("failed")
           const errorText = humanizeError(error)
           setErrorMessage(
@@ -850,23 +1311,34 @@ export function SessionPage() {
     return () => {
       cancelled = true
       navigator.mediaDevices?.removeEventListener?.("devicechange", handleDeviceChange)
+      clearReconnectTimer()
+      clearIceRefreshTimer()
       void cleanupSession()
     }
-  }, [joinToken, sessionId])
+  }, [iceTransportPolicy, joinToken, sessionId])
 
   useEffect(() => {
     if (supportsAudioOutputSelection && selectedAudioOutputId) {
-      void applyAudioOutputDevice(selectedAudioOutputId)
+      void applyAudioOutputDevice(selectedAudioOutputId).catch((error: unknown) => {
+        setErrorMessage(humanizeError(error))
+      })
     }
   }, [selectedAudioOutputId, supportsAudioOutputSelection])
 
   const stageMeta = stageCopy[connectionStage]
   const sessionLabel = sessionId ? shortSessionId(sessionId) : "unknown"
-  const remoteWaitingTitle = connectionStage === "connecting" ? "Подключаем собеседника" : "Ожидаем собеседника"
+  const remoteWaitingTitle =
+    connectionStage === "reconnecting"
+      ? "Восстанавливаем разговор"
+      : connectionStage === "connecting"
+        ? "Подключаем собеседника"
+        : "Ожидаем собеседника"
   const remoteWaitingDescription =
-    connectionStage === "connecting"
-      ? "Браузеры уже обмениваются сигналами. Видео появится здесь сразу после установки WebRTC-соединения."
-      : "Как только второй участник откроет ссылку, это окно переключится в полноэкранный режим разговора."
+    connectionStage === "reconnecting"
+      ? "Сигналинг временно пропал. Пытаемся заново синхронизировать состояние звонка без перезагрузки страницы."
+      : connectionStage === "connecting"
+        ? "Браузеры уже обмениваются сигналами. Видео появится здесь сразу после установки WebRTC-соединения."
+        : "Как только второй участник откроет ссылку, это окно переключится в полноэкранный режим разговора."
   const isRemoteVideoHidden = remoteConnected && !remoteMediaState.videoEnabled
 
   return (
@@ -883,6 +1355,7 @@ export function SessionPage() {
             ref={remoteVideoRef}
             autoPlay
             playsInline
+            data-testid="remote-video"
             className={cn("h-full w-full object-cover transition-opacity duration-300", !remoteConnected && "opacity-0")}
           />
 
@@ -890,7 +1363,7 @@ export function SessionPage() {
 
           {!remoteConnected ? (
             <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 bg-[radial-gradient(circle_at_top,rgba(14,165,233,0.22),transparent_32%),linear-gradient(180deg,#020617,#0f172a)] px-6 text-center text-white">
-              <LoaderCircle className={cn("h-10 w-10", connectionStage === "connecting" && "animate-spin")} />
+              <LoaderCircle className={cn("h-10 w-10", (connectionStage === "connecting" || connectionStage === "reconnecting") && "animate-spin")} />
               <div className="space-y-2">
                 <p className="font-display text-2xl font-bold sm:text-3xl">{remoteWaitingTitle}</p>
                 <p className="mx-auto max-w-xl text-sm leading-6 text-slate-300 sm:text-base">{remoteWaitingDescription}</p>
@@ -912,7 +1385,7 @@ export function SessionPage() {
           <div className="absolute inset-x-0 top-0 z-20 flex items-start justify-between gap-3 p-3 sm:p-4 md:p-5">
             <div className="flex flex-wrap items-center gap-2">
               <Badge className="border border-white/10 bg-black/45 text-white backdrop-blur-xl" variant={stageMeta.badge}>
-                {stageMeta.label}
+                <span data-testid="connection-stage">{stageMeta.label}</span>
               </Badge>
               <span className="rounded-full border border-white/10 bg-black/45 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.2em] text-slate-100 backdrop-blur-xl">
                 session {sessionLabel}
@@ -920,6 +1393,14 @@ export function SessionPage() {
               {role ? (
                 <span className="rounded-full border border-white/10 bg-black/45 px-3 py-1 text-xs font-medium text-slate-100 backdrop-blur-xl">
                   {role === "host" ? "Создатель" : "Гость"}
+                </span>
+              ) : null}
+              {connectionPath !== "unknown" ? (
+                <span
+                  className="rounded-full border border-emerald-300/20 bg-emerald-500/15 px-3 py-1 text-xs font-medium text-emerald-50 backdrop-blur-xl"
+                  data-testid="connection-path"
+                >
+                  {connectionPathCopy[connectionPath]}
                 </span>
               ) : null}
             </div>
@@ -938,15 +1419,30 @@ export function SessionPage() {
           </div>
 
           {errorMessage ? (
-            <div className="absolute left-1/2 top-20 z-20 w-[min(92%,54rem)] -translate-x-1/2 rounded-[22px] border border-rose-400/35 bg-rose-500/15 px-4 py-3 text-sm font-medium leading-6 text-rose-50 backdrop-blur-xl sm:top-24">
+            <div
+              className="absolute left-1/2 top-20 z-20 w-[min(92%,54rem)] -translate-x-1/2 rounded-[22px] border border-rose-400/35 bg-rose-500/15 px-4 py-3 text-sm font-medium leading-6 text-rose-50 backdrop-blur-xl sm:top-24"
+              data-testid="session-error"
+            >
               {errorMessage}
+            </div>
+          ) : null}
+
+          {!errorMessage && statusNote ? (
+            <div
+              className="absolute left-1/2 top-20 z-20 w-[min(92%,54rem)] -translate-x-1/2 rounded-[22px] border border-sky-300/35 bg-sky-500/15 px-4 py-3 text-sm font-medium leading-6 text-sky-50 backdrop-blur-xl sm:top-24"
+              data-testid="session-note"
+            >
+              {statusNote}
             </div>
           ) : null}
 
           {remoteConnected && (!remoteMediaState.audioEnabled || !remoteMediaState.videoEnabled) ? (
             <div className="absolute bottom-24 left-3 z-20 flex flex-wrap gap-2 sm:left-6 sm:bottom-6">
               {!remoteMediaState.audioEnabled ? (
-                <span className="rounded-full border border-white/10 bg-black/45 px-3 py-1.5 text-xs font-medium text-white backdrop-blur-xl">
+                <span
+                  className="rounded-full border border-white/10 bg-black/45 px-3 py-1.5 text-xs font-medium text-white backdrop-blur-xl"
+                  data-testid="remote-audio-muted"
+                >
                   У собеседника выключен микрофон
                 </span>
               ) : null}
@@ -963,7 +1459,14 @@ export function SessionPage() {
               className="absolute bottom-24 right-3 z-20 overflow-hidden rounded-[24px] border border-white/10 bg-slate-900/80 shadow-2xl backdrop-blur-xl sm:right-6 sm:bottom-24"
               style={{ width: "clamp(120px, 22vw, 260px)" }}
             >
-              <video ref={localVideoRef} autoPlay muted playsInline className="aspect-video w-full object-cover [transform:scaleX(-1)]" />
+              <video
+                ref={localVideoRef}
+                autoPlay
+                muted
+                playsInline
+                data-testid="local-video"
+                className="aspect-video w-full object-cover [transform:scaleX(-1)]"
+              />
               {!localMediaState.videoEnabled ? (
                 <div className="absolute inset-0 flex items-center justify-center bg-slate-950/75 px-4 text-center text-xs font-semibold text-white sm:text-sm">
                   Камера выключена

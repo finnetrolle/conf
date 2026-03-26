@@ -8,14 +8,17 @@ services:
       PUBLIC_APP_URL: ${PUBLIC_APP_URL:-https://localhost:3000}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-https://localhost:3000}
       STUN_URL: ${STUN_URL:-stun:stun.l.google.com:19302}
-      TURN_URL: ${TURN_URL:-turn:localhost:3478?transport=udp}
-      TURN_USERNAME: ${TURN_USERNAME:-webrtc}
-      TURN_PASSWORD: ${TURN_PASSWORD:-webrtc-secret}
+      TURN_URL: ${TURN_URL:-}
+      TURN_PORT: ${TURN_PORT:-3478}
+      TURN_TRANSPORT: ${TURN_TRANSPORT:-udp}
+      TURN_AUTH_SECRET: ${TURN_AUTH_SECRET:-webrtc-dev-auth-secret}
+      TURN_CREDENTIAL_TTL_MINUTES: ${TURN_CREDENTIAL_TTL_MINUTES:-60}
+      SIGNALING_RECONNECT_GRACE_SECONDS: ${SIGNALING_RECONNECT_GRACE_SECONDS:-5}
       SESSION_EMPTY_GRACE_SECONDS: ${SESSION_EMPTY_GRACE_SECONDS:-10}
       SESSION_RETENTION_SECONDS: ${SESSION_RETENTION_SECONDS:-300}
       SESSION_MAX_AGE_HOURS: ${SESSION_MAX_AGE_HOURS:-24}
     ports:
-      - "${API_PORT:-8080}:8080"
+      - "127.0.0.1:${API_PORT:-8080}:8080"
     depends_on:
       - coturn
 
@@ -24,7 +27,6 @@ services:
       context: ./apps/web
       dockerfile: Dockerfile
       args:
-        VITE_PUBLIC_APP_URL: ${VITE_PUBLIC_APP_URL:-}
         VITE_API_BASE_URL: ${VITE_API_BASE_URL:-}
         VITE_WS_BASE_URL: ${VITE_WS_BASE_URL:-}
     ports:
@@ -36,12 +38,36 @@ services:
       - server
 
   coturn:
-    image: coturn/coturn:latest
+    image: coturn/coturn@sha256:254a7e19f23366bc638af8e092c18ea52e0eefc9e44041f376e58b61b3b6d646
+    environment:
+      TURN_REALM: ${TURN_REALM:-conf.local}
+      TURN_AUTH_SECRET: ${TURN_AUTH_SECRET:-webrtc-dev-auth-secret}
+      TURN_MIN_PORT: ${TURN_MIN_PORT:-49160}
+      TURN_MAX_PORT: ${TURN_MAX_PORT:-49200}
+      TURN_EXTERNAL_IP: ${TURN_EXTERNAL_IP:-}
     command:
-      - -c
-      - /etc/coturn/turnserver.conf
+      - /bin/sh
+      - -ec
+      - |
+        cat >/tmp/turnserver.conf <<EOF
+        listening-port=3478
+        realm=$${TURN_REALM}
+        fingerprint
+        lt-cred-mech
+        use-auth-secret
+        static-auth-secret=$${TURN_AUTH_SECRET}
+        no-cli
+        no-tls
+        no-dtls
+        min-port=$${TURN_MIN_PORT}
+        max-port=$${TURN_MAX_PORT}
+        log-file=stdout
+        EOF
+        if [ -n "$${TURN_EXTERNAL_IP}" ]; then
+          printf '%s\n' "external-ip=$${TURN_EXTERNAL_IP}" >> /tmp/turnserver.conf
+        fi
+        exec turnserver -c /tmp/turnserver.conf
     ports:
       - "${TURN_PORT:-3478}:3478"
       - "${TURN_PORT:-3478}:3478/udp"
-    volumes:
-      - ./infra/coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+      - "${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49200}:${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49200}/udp"

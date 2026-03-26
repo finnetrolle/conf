@@ -1,6 +1,5 @@
 package com.example.calls
 
-import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.serialization.kotlinx.json.json
 import io.ktor.server.application.Application
@@ -35,7 +34,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
-
 fun main() {
     val config = AppConfigLoader.fromEnvironment()
     embeddedServer(
@@ -111,16 +109,45 @@ fun Application.module(
             }
 
             get("/ice-servers") {
+                val sessionId = call.request.queryParameters["sessionId"]
+                    ?: return@get call.respond(HttpStatusCode.BadRequest, mapOf("message" to "Missing sessionId"))
+                val joinToken = call.request.queryParameters["joinToken"]
+                    ?: return@get call.respond(HttpStatusCode.BadRequest, mapOf("message" to "Missing joinToken"))
+
+                val sessionInfo = registry.getSessionInfo(sessionId, joinToken)
+                    ?: return@get call.respond(HttpStatusCode.NotFound, mapOf("message" to "Session not found"))
+                if (sessionInfo.role == null) {
+                    return@get call.respond(HttpStatusCode.Forbidden, mapOf("message" to "Join token is invalid for this session."))
+                }
+                if (!sessionInfo.canJoin) {
+                    val status = when (sessionInfo.status) {
+                        SessionStatus.ENDED,
+                        SessionStatus.EXPIRED,
+                        -> HttpStatusCode.Gone
+
+                        else -> HttpStatusCode.Conflict
+                    }
+                    return@get call.respond(status, mapOf("message" to (sessionInfo.message ?: "ICE configuration is unavailable.")))
+                }
+
+                val iceServers = buildList {
+                    if (config.stunUrl.isNotBlank()) {
+                        add(IceServerConfig(urls = listOf(config.stunUrl)))
+                    }
+
+                    call.resolveTurnIceServer(config, sessionId, sessionInfo.role)?.let(::add)
+                }
+                this@module.environment.log.info(
+                    "Issued ICE config for session={} role={} servers={} turnEnabled={}",
+                    sessionId,
+                    sessionInfo.role.name.lowercase(),
+                    iceServers.size,
+                    iceServers.any { server -> server.urls.any { it.startsWith("turn:") } },
+                )
+
                 call.respond(
                     IceServersResponse(
-                        iceServers = listOf(
-                            IceServerConfig(urls = listOf(config.stunUrl)),
-                            IceServerConfig(
-                                urls = listOf(config.turnUrl),
-                                username = config.turnUsername,
-                                credential = config.turnPassword,
-                            ),
-                        ),
+                        iceServers = iceServers,
                     ),
                 )
             }
@@ -137,9 +164,18 @@ fun Application.module(
 
                     val clientMessage = JsonSupport.json.decodeFromString(ClientWsMessage.serializer(), frame.readText())
                     when (clientMessage.type) {
-                        "session.join" -> {
+                        "session.join",
+                        "session.resume",
+                        -> {
                             val payload = JsonSupport.json.decodeFromJsonElement(SessionJoinPayload.serializer(), clientMessage.payload)
-                            when (val joinResult = registry.join(payload.sessionId, payload.joinToken, this)) {
+                            when (
+                                val joinResult = registry.join(
+                                    payload.sessionId,
+                                    payload.joinToken,
+                                    this,
+                                    resumeRequested = clientMessage.type == "session.resume",
+                                )
+                            ) {
                                 is JoinResult.Success -> {
                                     joinedSessionId = payload.sessionId
                                     joinedToken = payload.joinToken
@@ -181,6 +217,7 @@ fun Application.module(
                         }
 
                         else -> {
+                            this@module.environment.log.warn("Unsupported WebSocket event type={}", clientMessage.type)
                             sendError("unsupported_event", "Unsupported event type: ${clientMessage.type}")
                         }
                     }
@@ -193,7 +230,12 @@ fun Application.module(
                 val sessionId = joinedSessionId
                 val token = joinedToken
                 if (sessionId != null && token != null) {
-                    registry.leave(sessionId, token, this)
+                    registry.markDisconnected(sessionId, token, this)?.let { reconnectGraceUntil ->
+                        cleanupScope.launch {
+                            delay(config.signalingReconnectGrace.toMillis())
+                            registry.finalizeDisconnect(sessionId, token, reconnectGraceUntil)
+                        }
+                    }
                 }
             }
         }
@@ -201,18 +243,29 @@ fun Application.module(
 }
 
 private fun ApplicationCall.resolvePublicAppUrl(config: AppConfig): String {
-    val forwardedProto = request.headers["X-Forwarded-Proto"]?.substringBefore(",")?.trim()
-    val forwardedHost = request.headers["X-Forwarded-Host"]?.substringBefore(",")?.trim()
-    if (!forwardedProto.isNullOrBlank() && !forwardedHost.isNullOrBlank()) {
-        return "$forwardedProto://$forwardedHost"
-    }
-
-    val origin = request.headers[HttpHeaders.Origin]?.substringBefore(",")?.trim()?.removeSuffix("/")
-    if (!origin.isNullOrBlank()) {
-        return origin
-    }
-
     return config.publicAppUrl.removeSuffix("/")
+}
+
+private fun ApplicationCall.resolveTurnIceServer(
+    config: AppConfig,
+    sessionId: String,
+    role: ParticipantRole,
+): IceServerConfig? {
+    val credentials = issueTurnCredentials(config, sessionId, role) ?: return null
+    val turnUrl = config.turnUrl ?: resolveTurnUrlFromPublicAppUrl(config) ?: return null
+    return IceServerConfig(
+        urls = listOf(turnUrl),
+        username = credentials.username,
+        credential = credentials.credential,
+    )
+}
+
+private fun resolveTurnUrlFromPublicAppUrl(config: AppConfig): String? {
+    val host = runCatching {
+        java.net.URI(config.publicAppUrl.removeSuffix("/")).host
+    }.getOrNull()?.takeIf { it.isNotBlank() } ?: return null
+
+    return "turn:$host:${config.turnPort}?transport=${config.turnTransport}"
 }
 
 private suspend fun DefaultWebSocketServerSession.sendError(code: String, message: String) {

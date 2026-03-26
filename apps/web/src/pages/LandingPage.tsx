@@ -75,6 +75,11 @@ export function LandingPage() {
     try {
       const response = await createSession()
       const targetUrl = new URL(response.hostUrl, window.location.origin)
+      if (targetUrl.origin !== window.location.origin) {
+        window.location.assign(response.hostUrl)
+        return
+      }
+
       navigate(targetUrl.pathname + targetUrl.search)
     } catch (error) {
       setErrorMessage(humanizeError(error))

@@ -49,4 +49,59 @@ jobs:
 
       - name: Run backend tests
         working-directory: apps/server
-        run: gradle test --no-daemon
+        run: ./gradlew test --no-daemon
+
+  smoke:
+    name: Stack Smoke
+    runs-on: ubuntu-latest
+    needs:
+      - server
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Start backend stack
+        run: docker compose up -d --build server coturn
+
+      - name: Run backend smoke test
+        run: node scripts/smoke/backend-smoke.mjs
+
+      - name: Print service logs on failure
+        if: failure()
+        run: docker compose logs server coturn
+
+      - name: Stop backend stack
+        if: always()
+        run: docker compose down -v
+
+  browser-e2e:
+    name: Browser WebRTC E2E
+    runs-on: ubuntu-latest
+    needs:
+      - smoke
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: apps/web
+        run: npm ci
+
+      - name: Install Playwright Chromium
+        working-directory: apps/web
+        run: npx playwright install --with-deps chromium
+
+      - name: Run browser WebRTC E2E
+        env:
+          COMPOSE_PROJECT_NAME: webrtc_e2e
+        run: ./scripts/e2e/run-webrtc-browser.sh

@@ -290,7 +290,6 @@ Both clients <------ ICE/STUN/TURN ------> coturn
 - `session.full`
 - `participant.joined`
 - `participant.left`
-- `session.ended`
 - `webrtc.offer`
 - `webrtc.answer`
 - `webrtc.ice_candidate`
@@ -474,7 +473,7 @@ Both clients <------ ICE/STUN/TURN ------> coturn
 Задачи:
 
 - корректно обрабатывать `tab close`, `refresh`, потерю сокета;
-- отправлять `participant.left` и `session.ended`;
+- отправлять `participant.left` и корректно завершать сессию после выхода последнего участника;
 - завершать сессию, когда последний участник вышел;
 - показывать причину ошибки в UI;
 - обработать сценарий `session full`;

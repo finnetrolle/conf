@@ -82,8 +82,26 @@ Backend:
 
 ```bash
 cd apps/server
-gradle test
+./gradlew test
 ```
+
+Container smoke:
+
+```bash
+docker compose up -d --build server coturn
+node scripts/smoke/backend-smoke.mjs
+docker compose down -v
+```
+
+Browser WebRTC e2e:
+
+```bash
+COMPOSE_PROJECT_NAME=webrtc_e2e ./scripts/e2e/run-webrtc-browser.sh
+```
+
+Сценарий прогоняет два режима: обычный `auto` и `relay-only`, где клиент принудительно использует только `TURN`.
+Для локального relay-прогона wrapper специально использует `127.0.0.1`, чтобы `TURN` шел по IPv4, а не через неоднозначный `localhost`.
+Для ручной диагностики можно открыть ссылку с `?iceTransport=relay`, чтобы проверить именно relay-путь.
 
 ## Подготовка к GitHub
 

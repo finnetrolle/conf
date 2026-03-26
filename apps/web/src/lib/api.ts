@@ -16,12 +16,22 @@ function resolveApiBaseUrl() {
 }
 
 async function parseJson<T>(response: Response): Promise<T> {
+  const rawBody = await response.text()
+
   if (!response.ok) {
-    const message = await response.text()
-    throw new Error(message || `HTTP ${response.status}`)
+    let errorMessage: string | null = null
+
+    try {
+      const parsed = JSON.parse(rawBody) as { message?: unknown }
+      if (typeof parsed.message === "string" && parsed.message.trim()) {
+        errorMessage = parsed.message
+      }
+    } catch {}
+
+    throw new Error(errorMessage || rawBody || `HTTP ${response.status}`)
   }
 
-  return (await response.json()) as T
+  return JSON.parse(rawBody) as T
 }
 
 export async function createSession() {
@@ -43,8 +53,10 @@ export async function getSessionInfo(sessionId: string, joinToken: string) {
   return parseJson<SessionInfoResponse>(response)
 }
 
-export async function getIceServers() {
-  const response = await fetch(`${resolveApiBaseUrl()}/api/ice-servers`)
+export async function getIceServers(sessionId: string, joinToken: string) {
+  const response = await fetch(
+    `${resolveApiBaseUrl()}/api/ice-servers?sessionId=${encodeURIComponent(sessionId)}&joinToken=${encodeURIComponent(joinToken)}`,
+  )
   return parseJson<IceServersResponse>(response)
 }
 

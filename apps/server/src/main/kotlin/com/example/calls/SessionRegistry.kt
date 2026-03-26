@@ -9,6 +9,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import org.slf4j.LoggerFactory
 import java.security.SecureRandom
 import java.time.Clock
 import java.time.Instant
@@ -18,6 +19,7 @@ class SessionRegistry(
     private val config: AppConfig,
     private val clock: Clock = Clock.systemUTC(),
 ) {
+    private val logger = LoggerFactory.getLogger(SessionRegistry::class.java)
     private val mutex = Mutex()
     private val sessions = linkedMapOf<String, SessionRecord>()
     private val random = SecureRandom()
@@ -54,6 +56,12 @@ class SessionRegistry(
         )
 
         sessions[sessionId] = session
+        logger.info(
+            "Created session {} with publicAppUrl={} activeSessions={}",
+            sessionId,
+            normalizedPublicAppUrl,
+            sessions.size,
+        )
 
         CreateSessionResponse(
             sessionId = sessionId,
@@ -84,7 +92,7 @@ class SessionRegistry(
                 canJoin = canJoin,
                 activeParticipants = session.activeParticipantCount(),
                 maxParticipants = 2,
-                shareUrl = session.shareUrl,
+                shareUrl = session.shareUrl.takeIf { role != null },
                 message = message,
             )
         }
@@ -93,31 +101,56 @@ class SessionRegistry(
         sessionId: String,
         joinToken: String,
         socket: DefaultWebSocketServerSession,
+        resumeRequested: Boolean = false,
     ): JoinResult {
         val joinResult = mutex.withLock {
             val session = sessions[sessionId]
-                ?: return@withLock JoinResult.Failure("session_not_found", "Session was not found.")
+                ?: return@withLock JoinResult.Failure("session_not_found", "Session was not found.").also {
+                    logger.warn("Join rejected: session {} was not found", sessionId)
+                }
 
             if (session.status == SessionStatus.ENDED || session.status == SessionStatus.EXPIRED) {
-                return@withLock JoinResult.Failure("session_ended", "Session has already ended.")
+                return@withLock JoinResult.Failure("session_ended", "Session has already ended.").also {
+                    logger.warn("Join rejected: session {} already ended with status={}", sessionId, session.status)
+                }
             }
 
             val role = roleForToken(session, joinToken)
-                ?: return@withLock JoinResult.Failure("invalid_join_token", "Join token is invalid for this session.")
+                ?: return@withLock JoinResult.Failure("invalid_join_token", "Join token is invalid for this session.").also {
+                    logger.warn("Join rejected: invalid token for session {}", sessionId)
+                }
             if (!session.canAccept(role)) {
-                return@withLock JoinResult.Failure("session_full", "Session is already full.")
+                return@withLock JoinResult.Failure("session_full", "Session is already full.").also {
+                    logger.warn("Join rejected: session {} is full for role={}", sessionId, role)
+                }
             }
 
             val participant = session.participants.getValue(role)
             val previousSocket = participant.socket
+            val gracefulResume = resumeRequested &&
+                previousSocket == null &&
+                participant.reconnectGraceUntil?.isAfter(now()) == true
             participant.socket = socket
             participant.connectedAt = now()
             participant.disconnectedAt = null
+            participant.reconnectGraceUntil = null
             session.emptySince = null
             session.lastActivityAt = now()
 
             val peer = session.peerOf(role)
-            session.status = if (peer.isActive()) SessionStatus.CONNECTING else SessionStatus.WAITING_FOR_PEER
+            session.status = when {
+                !peer.isActive() -> SessionStatus.WAITING_FOR_PEER
+                gracefulResume -> SessionStatus.ACTIVE
+                else -> SessionStatus.CONNECTING
+            }
+            logger.info(
+                "Participant joined session={} role={} activeParticipants={} status={} gracefulResume={}",
+                sessionId,
+                role.name.lowercase(),
+                session.activeParticipantCount(),
+                session.status,
+                gracefulResume,
+            )
 
             val outbound = buildList {
                 add(
@@ -130,14 +163,15 @@ class SessionRegistry(
                                 put("participantId", participant.participantId)
                                 put("role", role.name.lowercase())
                                 put("peerPresent", peer.isActive())
-                                put("shouldCreateOffer", role == ParticipantRole.HOST && peer.isActive())
+                                put("shouldCreateOffer", role == ParticipantRole.HOST && peer.isActive() && !gracefulResume)
+                                put("resumed", gracefulResume)
                                 put("activeParticipants", session.activeParticipantCount())
                             },
                         ),
                     ),
                 )
 
-                if (peer.isActive()) {
+                if (peer.isActive() && !gracefulResume) {
                     add(
                         OutboundMessage(
                             socket = peer.socket!!,
@@ -156,7 +190,7 @@ class SessionRegistry(
             JoinResult.Success(
                 role = role,
                 participantId = participant.participantId,
-                shouldCreateOffer = role == ParticipantRole.HOST && peer.isActive(),
+                shouldCreateOffer = role == ParticipantRole.HOST && peer.isActive() && !gracefulResume,
                 outboundMessages = outbound,
                 previousSocket = previousSocket?.takeIf { it != socket },
             )
@@ -173,6 +207,86 @@ class SessionRegistry(
         }
 
         return joinResult
+    }
+
+    internal suspend fun markDisconnected(
+        sessionId: String,
+        joinToken: String,
+        socket: DefaultWebSocketServerSession,
+    ): Instant? = mutex.withLock {
+        val session = sessions[sessionId] ?: return@withLock null
+        val role = roleForToken(session, joinToken) ?: return@withLock null
+        val participant = session.participants.getValue(role)
+        if (participant.socket != socket) {
+            return@withLock null
+        }
+
+        val disconnectedAt = now()
+        val reconnectGraceUntil = disconnectedAt.plus(config.signalingReconnectGrace)
+        participant.socket = null
+        participant.disconnectedAt = disconnectedAt
+        participant.reconnectGraceUntil = reconnectGraceUntil
+        session.lastActivityAt = disconnectedAt
+        if (session.activeParticipantCount() == 0) {
+            session.emptySince = disconnectedAt
+        }
+        logger.info(
+            "Participant signaling disconnected session={} role={} activeParticipants={} reconnectGraceUntil={}",
+            sessionId,
+            role.name.lowercase(),
+            session.activeParticipantCount(),
+            reconnectGraceUntil,
+        )
+
+        reconnectGraceUntil
+    }
+
+    internal suspend fun finalizeDisconnect(
+        sessionId: String,
+        joinToken: String,
+        reconnectGraceUntil: Instant,
+    ) {
+        val outboundMessages = mutex.withLock<List<OutboundMessage>> {
+            val session = sessions[sessionId] ?: return@withLock emptyList()
+            val role = roleForToken(session, joinToken) ?: return@withLock emptyList()
+            val participant = session.participants.getValue(role)
+
+            if (participant.socket != null || participant.reconnectGraceUntil != reconnectGraceUntil) {
+                return@withLock emptyList()
+            }
+
+            participant.reconnectGraceUntil = null
+            session.lastActivityAt = now()
+            session.status = SessionStatus.WAITING_FOR_PEER
+
+            val peer = session.peerOf(role)
+            logger.info(
+                "Reconnect grace expired for session={} role={} activeParticipants={} status={}",
+                sessionId,
+                role.name.lowercase(),
+                session.activeParticipantCount(),
+                session.status,
+            )
+
+            buildList {
+                if (peer.isActive()) {
+                    add(
+                        OutboundMessage(
+                            socket = peer.socket!!,
+                            message = serverMessage(
+                                type = "participant.left",
+                                payload = buildJsonObject {
+                                    put("participantId", participant.participantId)
+                                    put("role", participant.role.name.lowercase())
+                                },
+                            ),
+                        ),
+                    )
+                }
+            }
+        }
+
+        outboundMessages.sendAll()
     }
 
     internal suspend fun forward(
@@ -197,7 +311,32 @@ class SessionRegistry(
             }
 
             if (!recipient.isActive()) {
+                logger.info(
+                    "Dropping signal type={} for session={} fromRole={} because peer is offline",
+                    type,
+                    sessionId,
+                    senderRole.name.lowercase(),
+                )
                 return@withLock emptyList()
+            }
+
+            when (type) {
+                "webrtc.ice_candidate" -> logger.info(
+                    "Forwarding ICE candidate for session={} fromRole={} toRole={} candidateType={}",
+                    sessionId,
+                    senderRole.name.lowercase(),
+                    recipient.role.name.lowercase(),
+                    payload["candidate"]?.toString()?.let(::candidateTypeOf) ?: "unknown",
+                )
+
+                else -> logger.info(
+                    "Forwarding signal type={} for session={} fromRole={} toRole={} status={}",
+                    type,
+                    sessionId,
+                    senderRole.name.lowercase(),
+                    recipient.role.name.lowercase(),
+                    session.status,
+                )
             }
 
             listOf(
@@ -237,6 +376,7 @@ class SessionRegistry(
 
             participant.socket = null
             participant.disconnectedAt = now()
+            participant.reconnectGraceUntil = null
             session.lastActivityAt = now()
 
             val peer = session.peerOf(role)
@@ -244,6 +384,14 @@ class SessionRegistry(
             if (session.activeParticipantCount() == 0) {
                 session.emptySince = now()
             }
+            logger.info(
+                "Participant left session={} role={} activeParticipants={} status={} emptySince={}",
+                sessionId,
+                role.name.lowercase(),
+                session.activeParticipantCount(),
+                session.status,
+                session.emptySince,
+            )
 
             buildList {
                 if (peer.isActive()) {
@@ -274,6 +422,7 @@ class SessionRegistry(
                 val (_, session) = iterator.next()
 
                 if (session.endedAt != null && now.isAfter(session.endedAt!!.plus(config.endedSessionRetention))) {
+                    logger.info("Removing retained session {} with status={}", session.sessionId, session.status)
                     iterator.remove()
                     continue
                 }
@@ -283,6 +432,13 @@ class SessionRegistry(
                 if ((sessionExpired || emptyTooLong) && session.activeParticipantCount() == 0) {
                     session.status = if (sessionExpired) SessionStatus.EXPIRED else SessionStatus.ENDED
                     session.endedAt = now
+                    logger.info(
+                        "Marked session {} as {} sessionExpired={} emptyTooLong={}",
+                        session.sessionId,
+                        session.status,
+                        sessionExpired,
+                        emptyTooLong,
+                    )
                 }
             }
         }
@@ -321,6 +477,15 @@ class SessionRegistry(
     }
 
     private fun now(): Instant = Instant.now(clock)
+
+    private fun candidateTypeOf(candidateJson: String): String {
+        val candidate = candidateJson.substringAfter("\"candidate\":\"", missingDelimiterValue = candidateJson)
+            .substringBefore('"')
+            .replace("\\\\", "\\")
+        val parts = candidate.split(' ')
+        val typeIndex = parts.indexOf("typ")
+        return if (typeIndex >= 0 && typeIndex + 1 < parts.size) parts[typeIndex + 1] else "unknown"
+    }
 }
 
 private suspend fun List<OutboundMessage>.sendAll() {

@@ -50,7 +50,7 @@ data class SessionInfoResponse(
     val canJoin: Boolean,
     val activeParticipants: Int,
     val maxParticipants: Int,
-    val shareUrl: String,
+    val shareUrl: String? = null,
     val message: String? = null,
 )
 
@@ -108,6 +108,7 @@ internal data class ParticipantRecord(
     var socket: DefaultWebSocketServerSession? = null,
     var connectedAt: Instant? = null,
     var disconnectedAt: Instant? = null,
+    var reconnectGraceUntil: Instant? = null,
     var audioEnabled: Boolean = true,
     var videoEnabled: Boolean = true,
 )
