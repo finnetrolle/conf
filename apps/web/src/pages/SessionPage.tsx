@@ -84,20 +84,25 @@ type InviteActionFeedback = {
 const defaultMediaState: MediaState = { audioEnabled: true, videoEnabled: true }
 
 const stageCopy: Record<ConnectionStage, { label: string; badge: "amber" | "blue" | "green" | "rose" | "slate" }> = {
-  loading: { label: "Загружаем сессию", badge: "slate" },
-  preparing: { label: "Готовим камеру и микрофон", badge: "blue" },
-  waiting: { label: "Ждем второго участника", badge: "amber" },
-  connecting: { label: "Соединяем браузеры", badge: "blue" },
-  connected: { label: "Соединение активно", badge: "green" },
-  reconnecting: { label: "Восстанавливаем сигналинг", badge: "amber" },
-  ended: { label: "Сессия завершена", badge: "slate" },
-  failed: { label: "Нужно вмешательство", badge: "rose" },
+  loading: { label: "Открываем звонок", badge: "slate" },
+  preparing: { label: "Проверяем камеру и звук", badge: "blue" },
+  waiting: { label: "Ждем собеседника", badge: "amber" },
+  connecting: { label: "Подключаем собеседника", badge: "blue" },
+  connected: { label: "Можно разговаривать", badge: "green" },
+  reconnecting: { label: "Возвращаем звонок", badge: "amber" },
+  ended: { label: "Звонок завершен", badge: "slate" },
+  failed: { label: "Связь недоступна", badge: "rose" },
+}
+
+const roleCopy: Record<ParticipantRole, string> = {
+  host: "Вы начали звонок",
+  guest: "Вы подключились по приглашению",
 }
 
 const connectionPathCopy: Record<ConnectionPath, string> = {
-  unknown: "Маршрут не определен",
-  direct: "P2P direct",
-  relay: "TURN relay",
+  unknown: "Определяем",
+  direct: "Напрямую",
+  relay: "Через запасной канал",
 }
 
 function extractTurnCredentialExpiry(iceServers: IceServerConfig[]) {
@@ -131,16 +136,15 @@ function isConstraintError(error: unknown) {
 
 function getMediaEnvironmentIssue() {
   if (typeof window !== "undefined" && !window.isSecureContext) {
-    const secureUrl = `https://${window.location.host}${window.location.pathname}${window.location.search}`
-    return `Страница открыта по небезопасному адресу ${window.location.origin}. На других устройствах браузер разрешает камеру и микрофон только по HTTPS или на localhost. Открой ${secureUrl} и подтверди локальный сертификат браузера.`
+    return "На этой странице камера и микрофон не работают. Откройте приглашение заново в обычном браузере и попробуйте еще раз."
   }
 
   if (!navigator.mediaDevices) {
-    return "В этом окружении браузер не предоставляет Web Media API. Обычно это происходит из-за HTTP вместо HTTPS или из-за ограничений самого браузера."
+    return "На этой странице браузер не может включить камеру и микрофон. Откройте ссылку в обычном браузере и попробуйте снова."
   }
 
   if (typeof navigator.mediaDevices.getUserMedia !== "function") {
-    return "Браузер не поддерживает getUserMedia в текущем окружении. Обычно это происходит из-за HTTP вместо HTTPS."
+    return "Этот браузер не может включить камеру и микрофон для звонка. Откройте приглашение в Chrome, Safari или другом обычном браузере."
   }
 
   return null
@@ -238,10 +242,9 @@ function getFocusableElements(container: HTMLElement) {
   )
 }
 
-function buildInviteCopy(shareUrl: string, sessionLabel: string) {
-  const sessionHint = sessionLabel === "unknown" ? "" : ` к сессии ${sessionLabel}`
+function buildInviteCopy(shareUrl: string) {
   const title = "Приглашение на видеозвонок"
-  const text = `Вас приглашают на видеозвонок. Откройте ссылку, чтобы сразу подключиться${sessionHint}.`
+  const text = "Вас приглашают на видеозвонок. Откройте ссылку, чтобы присоединиться."
 
   return {
     title,
@@ -319,6 +322,7 @@ export function SessionPage() {
   const searchParams = useMemo(() => new URLSearchParams(location.search), [location.search])
   const joinToken = searchParams.get("joinToken") ?? ""
   const iceTransportPolicy = searchParams.get("iceTransport") === "relay" ? "relay" : "all"
+  const supportMode = searchParams.get("support") === "1" || searchParams.get("debug") === "1"
 
   const [sessionInfo, setSessionInfo] = useState<SessionInfoResponse | null>(null)
   const [connectionStage, setConnectionStage] = useState<ConnectionStage>("loading")
@@ -962,12 +966,12 @@ export function SessionPage() {
         case "disconnected":
           setConnectionStage("connecting")
           setRemoteConnected(false)
-          setStatusNote("Медиа-соединение просело. Пробуем вернуть аудио и видео без перезагрузки страницы.")
+          setStatusNote("Связь стала нестабильной. Пытаемся вернуть звук и видео без перезагрузки страницы.")
           break
         case "failed":
           setConnectionStage("failed")
           setStatusNote(null)
-          setErrorMessage("WebRTC-соединение не удалось стабилизировать. Попробуйте открыть ссылку заново.")
+          setErrorMessage("Не удалось снова соединить звонок. Откройте ссылку еще раз.")
           break
         default:
           break
@@ -1152,7 +1156,7 @@ export function SessionPage() {
         }
         await resetPeerConnection(true)
         setErrorMessage(null)
-        setStatusNote("Собеседник вышел из звонка. Сессия остается открытой, можно дождаться повторного входа по той же ссылке.")
+        setStatusNote("Собеседник вышел из звонка. Можно подождать здесь или отправить приглашение еще раз.")
         setConnectionStage("waiting")
         break
       }
@@ -1184,7 +1188,10 @@ export function SessionPage() {
       }
       case "error": {
         const code = typeof message.payload.code === "string" ? message.payload.code : "unknown_error"
-        const messageText = typeof message.payload.message === "string" ? message.payload.message : "Не удалось обработать signaling-событие."
+        const messageText =
+          typeof message.payload.message === "string"
+            ? message.payload.message
+            : "Во время звонка произошла ошибка. Обновите страницу и попробуйте снова."
         const isTerminalSessionError = ["invalid_join_token", "session_not_found", "session_full", "session_ended"].includes(code)
         reconnectEnabledRef.current = !isTerminalSessionError
         if (isTerminalSessionError) {
@@ -1217,13 +1224,13 @@ export function SessionPage() {
     if (nextAttempt > 3) {
       setStatusNote(null)
       setConnectionStage("failed")
-      setErrorMessage("Сигналинг не удалось восстановить после нескольких попыток. Открой ссылку заново.")
+      setErrorMessage("Связь не восстановилась. Откройте ссылку еще раз, чтобы продолжить звонок.")
       return
     }
 
     const delayMs = Math.min(1_000 * nextAttempt, 4_000)
     setErrorMessage(null)
-    setStatusNote(`Сигналинг временно потерян. Пробуем переподключиться (${nextAttempt}/3).`)
+    setStatusNote(`Связь ненадолго прервалась. Возвращаем звонок (${nextAttempt}/3).`)
     setConnectionStage("reconnecting")
     console.warn("Scheduling signaling reconnect", { attempt: nextAttempt, delayMs })
 
@@ -1242,7 +1249,7 @@ export function SessionPage() {
     socket.onopen = () => {
       console.info("Signaling socket open", { isReconnect })
       if (isReconnect) {
-        setStatusNote("Сигналинг восстановлен. Синхронизируем состояние звонка.")
+        setStatusNote("Связь вернулась. Проверяем, можно ли продолжить звонок.")
       }
       sendSocketMessage(isReconnect ? "session.resume" : "session.join", {
         sessionId: currentSessionId,
@@ -1557,7 +1564,7 @@ export function SessionPage() {
     async function bootstrap() {
       if (!sessionId || !joinToken) {
         setConnectionStage("failed")
-        setErrorMessage("Не хватает параметров ссылки для входа в сессию.")
+        setErrorMessage("Ссылка на звонок открыта не полностью. Откройте приглашение еще раз.")
         return
       }
 
@@ -1579,7 +1586,7 @@ export function SessionPage() {
         if (!session.canJoin || !session.role) {
           setStatusNote(null)
           setConnectionStage(session.status === "ended" || session.status === "expired" ? "ended" : "failed")
-          setErrorMessage(session.message ?? "Сессия недоступна для подключения.")
+          setErrorMessage(session.message ?? "Этот звонок сейчас недоступен. Попросите отправить новое приглашение.")
           return
         }
 
@@ -1605,8 +1612,8 @@ export function SessionPage() {
           }
         }
 
-        if (iceTransportPolicy === "relay") {
-          setStatusNote("Включен relay-only режим: браузер будет использовать только TURN для диагностики сетевого пути.")
+        if (supportMode && iceTransportPolicy === "relay") {
+          setStatusNote("Режим проверки сети включен. При необходимости звонок пройдет через запасной маршрут.")
         } else {
           setStatusNote(null)
         }
@@ -1617,11 +1624,7 @@ export function SessionPage() {
           setStatusNote(null)
           setConnectionStage("failed")
           const errorText = humanizeError(error)
-          setErrorMessage(
-            isConstraintError(error)
-              ? `Браузер отклонил параметры доступа к устройствам: ${errorText}. Я переключил код на безопасные fallback-режимы, перезагрузи страницу и попробуй снова.`
-              : errorText,
-          )
+          setErrorMessage(errorText)
         }
       }
     }
@@ -1643,7 +1646,7 @@ export function SessionPage() {
       clearInviteFeedbackResetTimer()
       void cleanupSession()
     }
-  }, [iceTransportPolicy, joinToken, sessionId])
+  }, [iceTransportPolicy, joinToken, sessionId, supportMode])
 
   useEffect(() => {
     if (supportsAudioOutputSelection && selectedAudioOutputId) {
@@ -1653,7 +1656,7 @@ export function SessionPage() {
     }
   }, [selectedAudioOutputId, supportsAudioOutputSelection])
 
-  const sessionLabel = sessionId ? shortSessionId(sessionId) : "unknown"
+  const sessionLabel = sessionId ? shortSessionId(sessionId) : "----"
   const smsRequiresManualPaste = isIosDevice()
   const isInviteAvailable = Boolean(
     sessionInfo?.canJoin &&
@@ -1667,8 +1670,8 @@ export function SessionPage() {
       return null
     }
 
-    return buildInviteCopy(sessionInfo.shareUrl, sessionLabel)
-  }, [isInviteAvailable, sessionInfo?.shareUrl, sessionLabel])
+    return buildInviteCopy(sessionInfo.shareUrl)
+  }, [isInviteAvailable, sessionInfo?.shareUrl])
   const nativeShareData = inviteMeta
     ? {
         title: inviteMeta.title,
@@ -1692,7 +1695,7 @@ export function SessionPage() {
       },
       {
         label: "Telegram",
-        description: "Передадим ссылку и понятный текст в системный шаринг Telegram.",
+        description: "Откроем Telegram с готовой ссылкой и коротким приглашением.",
         href: `https://t.me/share/url?url=${encodeURIComponent(inviteMeta.shareUrl)}&text=${encodeURIComponent(inviteMeta.text)}`,
         icon: Send,
         external: true,
@@ -1850,22 +1853,22 @@ export function SessionPage() {
   const stageMeta = stageCopy[connectionStage]
   const remoteWaitingTitle =
     connectionStage === "ended"
-      ? "Сессия завершена"
+      ? "Звонок завершен"
       : connectionStage === "failed"
-        ? "Подключение недоступно"
+        ? "Подключиться не получилось"
         : connectionStage === "reconnecting"
-      ? "Восстанавливаем разговор"
+      ? "Возвращаем звонок"
       : connectionStage === "connecting"
         ? "Подключаем собеседника"
-        : "Ожидаем собеседника"
+        : "Ждем собеседника"
   const remoteWaitingDescription =
     connectionStage === "reconnecting"
-      ? "Сигналинг временно пропал. Пытаемся заново синхронизировать состояние звонка без перезагрузки страницы."
+      ? "Связь ненадолго прервалась. Пытаемся продолжить разговор без перезагрузки страницы."
       : connectionStage === "ended" || connectionStage === "failed"
-        ? "Эта сессия больше недоступна для новых подключений, поэтому отправка приглашений отключена."
+        ? "По этой ссылке сейчас нельзя подключиться. Начните новый звонок или попросите отправить новое приглашение."
       : connectionStage === "connecting"
-        ? "Браузеры уже обмениваются сигналами. Видео появится здесь сразу после установки WebRTC-соединения."
-        : "Отправьте приглашение удобным способом. Как только второй участник откроет ссылку, это окно переключится в полноэкранный режим разговора."
+        ? "Подключаем звук и видео. Обычно это занимает всего несколько секунд."
+        : "Отправьте приглашение удобным способом. Как только второй человек откроет ссылку, разговор начнется автоматически."
   const isRemoteVideoHidden = remoteConnected && !remoteMediaState.videoEnabled
 
   return (
@@ -1903,7 +1906,7 @@ export function SessionPage() {
               <div className="space-y-2">
                 <p className="font-display text-2xl font-bold sm:text-3xl">Видео собеседника скрыто</p>
                 <p className="mx-auto max-w-lg text-sm leading-6 text-slate-300 sm:text-base">
-                  Соединение остается активным, поэтому вы можете продолжать разговор по аудио.
+                  Разговор продолжается, поэтому можно спокойно общаться только голосом.
                 </p>
               </div>
             </div>
@@ -1914,15 +1917,17 @@ export function SessionPage() {
               <Badge className="border border-white/10 bg-black/45 text-white backdrop-blur-xl" variant={stageMeta.badge}>
                 <span data-testid="connection-stage">{stageMeta.label}</span>
               </Badge>
-              <span className="rounded-full border border-white/10 bg-black/45 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.2em] text-slate-100 backdrop-blur-xl">
-                session {sessionLabel}
-              </span>
               {role ? (
                 <span className="rounded-full border border-white/10 bg-black/45 px-3 py-1 text-xs font-medium text-slate-100 backdrop-blur-xl">
-                  {role === "host" ? "Создатель" : "Гость"}
+                  {roleCopy[role]}
                 </span>
               ) : null}
-              {connectionPath !== "unknown" ? (
+              {supportMode ? (
+                <span className="rounded-full border border-white/10 bg-black/45 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.2em] text-slate-100 backdrop-blur-xl">
+                  код звонка {sessionLabel}
+                </span>
+              ) : null}
+              {supportMode && connectionPath !== "unknown" ? (
                 <span
                   className="rounded-full border border-emerald-300/20 bg-emerald-500/15 px-3 py-1 text-xs font-medium text-emerald-50 backdrop-blur-xl"
                   data-testid="connection-path"
@@ -2053,7 +2058,7 @@ export function SessionPage() {
 
               <div className="absolute left-3 top-3">
                 <span className="rounded-full border border-white/10 bg-black/45 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.2em] text-white backdrop-blur-xl">
-                  Ты
+                  Вы
                 </span>
               </div>
 
@@ -2077,7 +2082,7 @@ export function SessionPage() {
             >
               <Eye className="h-4 w-4" />
               <span className="hidden sm:inline">Показать себя</span>
-              <span className="sm:hidden">Ты</span>
+              <span className="sm:hidden">Вы</span>
             </Button>
           )}
 
@@ -2088,7 +2093,7 @@ export function SessionPage() {
                   <div className="space-y-1">
                     <p className="text-sm font-semibold text-white">Устройства</p>
                     <p className="text-xs leading-5 text-slate-300">
-                      Переключай камеру, микрофон и аудиовыход, не выходя из звонка.
+                      Можно поменять камеру, микрофон и устройство вывода звука, не выходя из звонка.
                     </p>
                   </div>
                   <Button
@@ -2096,8 +2101,8 @@ export function SessionPage() {
                     variant="outline"
                     size="sm"
                     onClick={() => setIsSettingsVisible(false)}
-                    aria-label="Скрыть настройки"
-                    title="Скрыть настройки"
+                    aria-label="Закрыть настройки"
+                    title="Закрыть настройки"
                   >
                     <X className="h-4 w-4" />
                   </Button>
@@ -2152,7 +2157,7 @@ export function SessionPage() {
 
                   <div className="space-y-2">
                     <Label className="text-slate-200" htmlFor="speaker-select">
-                      Аудиовыход
+                      Куда выводить звук
                     </Label>
                     <Select
                       id="speaker-select"
@@ -2168,7 +2173,7 @@ export function SessionPage() {
                           </option>
                         ))
                       ) : (
-                        <option value="">Текущий системный вывод</option>
+                        <option value="">Устройство по умолчанию</option>
                       )}
                     </Select>
                   </div>
@@ -2176,9 +2181,23 @@ export function SessionPage() {
 
                 <p className="text-xs leading-5 text-slate-300">
                   {supportsAudioOutputSelection
-                    ? "Если браузер поддерживает setSinkId, выбранный выход применится к удаленному аудио."
-                    : "Этот браузер не поддерживает переключение аудиовыхода через Web API."}
+                    ? "Если браузер разрешает переключение, голос собеседника пойдет на выбранное устройство."
+                    : "Если переключение здесь не сработает, звук останется на устройстве, выбранном в системе."}
                 </p>
+
+                {supportMode ? (
+                  <div className="rounded-[24px] border border-amber-300/20 bg-amber-400/10 p-4">
+                    <p className="text-xs font-semibold uppercase tracking-[0.22em] text-amber-200">Режим помощи</p>
+                    <div className="mt-3 grid gap-2 text-sm leading-6 text-slate-100 sm:grid-cols-3">
+                      <p>Код звонка: {sessionLabel}</p>
+                      <p>Как вы вошли: {role ? roleCopy[role] : "Определяем"}</p>
+                      <p>Путь связи: {connectionPathCopy[connectionPath]}</p>
+                    </div>
+                    <p className="mt-3 text-xs leading-5 text-slate-300">
+                      Этот блок нужен для поддержки и скрыт в обычном режиме.
+                    </p>
+                  </div>
+                ) : null}
               </CardContent>
             </Card>
           ) : null}
@@ -2344,7 +2363,7 @@ export function SessionPage() {
                           </p>
                         </div>
                         <span className="rounded-full bg-slate-100 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.2em] text-slate-500">
-                          Session {sessionLabel}
+                          без ввода ссылки
                         </span>
                       </div>
 
@@ -2424,8 +2443,8 @@ export function SessionPage() {
                 variant={isSettingsVisible ? "default" : "outline"}
                 onClick={() => setIsSettingsVisible((current) => !current)}
                 disabled={Boolean(mediaAccessIssue)}
-                aria-label={isSettingsVisible ? "Скрыть настройки" : "Показать настройки"}
-                title={isSettingsVisible ? "Скрыть настройки" : "Показать настройки"}
+                aria-label={isSettingsVisible ? "Закрыть настройки" : "Показать настройки"}
+                title={isSettingsVisible ? "Закрыть настройки" : "Показать настройки"}
               >
                 <Settings2 className="h-5 w-5" />
               </Button>
@@ -2434,8 +2453,8 @@ export function SessionPage() {
                 className="h-12 w-12 bg-rose-500 p-0 text-white hover:bg-rose-600"
                 variant="destructive"
                 onClick={handleLeaveSession}
-                aria-label="Покинуть сессию"
-                title="Покинуть сессию"
+                aria-label="Выйти из звонка"
+                title="Выйти из звонка"
               >
                 <PhoneOff className="h-5 w-5" />
               </Button>

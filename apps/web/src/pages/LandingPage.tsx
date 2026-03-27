@@ -15,18 +15,18 @@ import { createSession, humanizeError } from "@/lib/api"
 const steps = [
   {
     icon: Link2,
-    title: "Создать сессию",
-    text: "Один клик открывает персональную ссылку и сразу переводит в экран звонка.",
+    title: "Начать звонок",
+    text: "Одна кнопка сразу открывает ваш звонок и готовую ссылку для приглашения.",
   },
   {
     icon: Video,
-    title: "Проверить устройства",
-    text: "Камера, микрофон и локальное превью доступны сразу, без отдельного мастера настройки.",
+    title: "Проверить камеру и звук",
+    text: "Сразу видно, работают ли камера и микрофон, без лишних экранов и настроек.",
   },
   {
     icon: Share2,
     title: "Отправить приглашение",
-    text: "Мессенджеры, SMS, системный share и QR-код помогают подключить второго участника в один шаг.",
+    text: "Ссылку можно быстро отправить в мессенджере, SMS или показать QR-код рядом.",
   },
 ]
 
@@ -54,12 +54,12 @@ const benefits = [
   {
     icon: ShieldCheck,
     title: "Меньше трения",
-    text: "Никаких промежуточных комнат, приглашений по почте и лишних подтверждений.",
+    text: "Без регистрации, длинных инструкций и лишних подтверждений перед разговором.",
   },
   {
     icon: TimerReset,
-    title: "Сессия не зависает",
-    text: "Когда оба участника выходят, сервер автоматически завершает встречу.",
+    title: "Пустой звонок закрывается сам",
+    text: "Если все вышли, звонок не остается висеть и сам аккуратно завершается.",
   },
 ]
 
@@ -99,7 +99,7 @@ export function LandingPage() {
           <div className="relative grid gap-10 lg:grid-cols-[minmax(0,1.05fr)_minmax(340px,0.95fr)] lg:items-center">
             <div className="space-y-8">
               <div className="inline-flex items-center rounded-full border border-orange-200 bg-orange-50 px-4 py-2 text-xs font-semibold uppercase tracking-[0.24em] text-orange-700 shadow-sm">
-                Browser-first 1:1 calling
+                Звонок без регистрации
               </div>
 
               <div className="space-y-5">
@@ -111,8 +111,8 @@ export function LandingPage() {
                   Ни одного лишнего шага.
                 </h1>
                 <p className="max-w-2xl text-lg leading-8 text-slate-600 sm:text-[1.15rem]">
-                  Открываешь страницу, создаешь сессию и сразу попадаешь в звонок. Второй участник получает понятное
-                  приглашение, открывает ссылку или QR и попадает в тот же интерфейс без регистрации и промежуточных экранов.
+                  Открываете страницу, начинаете звонок и сразу попадаете на экран разговора. Второй человек получает
+                  понятное приглашение, открывает ссылку или QR-код и подключается без регистрации и лишних шагов.
                 </p>
               </div>
 
@@ -123,11 +123,11 @@ export function LandingPage() {
                   onClick={handleCreateSession}
                   disabled={isCreating}
                 >
-                  {isCreating ? "Создаем сессию..." : "Создать сессию"}
+                  {isCreating ? "Начинаем звонок..." : "Начать звонок"}
                   <ArrowRight className="h-4 w-4" />
                 </Button>
                 <p className="max-w-xs text-sm leading-6 text-slate-500">
-                  После создания ты сразу попадешь в звонок и сможешь отправить приглашение второму участнику удобным способом.
+                  После этого вы сразу попадете в звонок и сможете пригласить близкого удобным способом.
                 </p>
               </div>
 
@@ -153,7 +153,7 @@ export function LandingPage() {
             <div className="relative pt-12 sm:pt-16 lg:pt-10">
               <div className="absolute right-0 top-0 z-10 hidden w-56 rounded-[28px] border border-orange-200/80 bg-orange-100 p-4 text-slate-950 shadow-[0_24px_60px_-36px_rgba(15,23,42,0.5)] sm:block">
                 <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-500">Что видно сразу</p>
-                <p className="mt-2 text-base font-semibold leading-6">Камеру, микрофон и статус подключения с первого взгляда.</p>
+                <p className="mt-2 text-base font-semibold leading-6">Камеру, микрофон и понятную подсказку о том, что происходит.</p>
               </div>
 
               <div className="relative overflow-hidden rounded-[34px] border border-slate-900/10 bg-slate-950 p-5 text-white shadow-[0_36px_90px_-42px_rgba(15,23,42,0.75)] sm:p-6">
@@ -162,10 +162,10 @@ export function LandingPage() {
                   <div className="flex items-start justify-between gap-4">
                     <div className="max-w-sm">
                       <p className="text-xs font-semibold uppercase tracking-[0.24em] text-slate-300">Экран встречи</p>
-                      <h2 className="mt-3 font-display text-3xl leading-tight text-white">Все важное собрано в одном понятном блоке.</h2>
+                      <h2 className="mt-3 font-display text-3xl leading-tight text-white">Все важное собрано в одном спокойном экране.</h2>
                     </div>
                     <div className="rounded-full border border-emerald-400/25 bg-emerald-400/10 px-3 py-1 text-xs font-semibold uppercase tracking-[0.18em] text-emerald-200">
-                      live flow
+                      без лишних шагов
                     </div>
                   </div>
 
@@ -195,13 +195,13 @@ export function LandingPage() {
                     <div className="rounded-[24px] border border-white/12 bg-white px-4 py-4 text-slate-950">
                       <p className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">Внутри звонка</p>
                       <p className="mt-2 text-sm font-medium leading-6">
-                        Приглашение отправляется одной кнопкой прямо из интерфейса видеосвязи.
+                        Приглашение отправляется одной кнопкой прямо во время звонка.
                       </p>
                     </div>
                     <div className="rounded-[24px] border border-white/12 bg-sky-100 px-4 py-4 text-slate-950">
                       <p className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">После встречи</p>
                       <p className="mt-2 text-sm font-medium leading-6">
-                        Пустые сессии не висят бесконечно: сервер завершает их автоматически.
+                        Если никто не подключен, пустой звонок сам аккуратно закрывается.
                       </p>
                     </div>
                   </div>
@@ -216,8 +216,8 @@ export function LandingPage() {
             <p className="text-xs font-semibold uppercase tracking-[0.24em] text-slate-400">Для быстрых созвонов</p>
             <h3 className="mt-4 max-w-lg font-display text-3xl leading-tight">Когда нужно просто созвониться, интерфейс не должен мешать.</h3>
             <p className="mt-4 max-w-xl text-sm leading-7 text-slate-300">
-              Сервис оставляет только ключевые действия: создать сессию, отправить приглашение, проверить устройства и
-              завершить встречу без лишних сущностей вокруг.
+              Здесь остаются только главные действия: начать звонок, пригласить близкого, проверить камеру и звук и
+              спокойно завершить разговор.
             </p>
           </div>
 

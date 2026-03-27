@@ -27,12 +27,11 @@ async function createSession() {
 }
 
 function withIceTransport(url, mode) {
-  if (mode !== "relay") {
-    return url
-  }
-
   const nextUrl = new URL(url)
-  nextUrl.searchParams.set("iceTransport", "relay")
+  if (mode === "relay") {
+    nextUrl.searchParams.set("support", "1")
+    nextUrl.searchParams.set("iceTransport", "relay")
+  }
   return nextUrl.toString()
 }
 
@@ -66,8 +65,26 @@ async function waitForStage(page, expectedText, timeout = 20_000) {
   }, expectedText, { timeout })
 }
 
+async function assertSupportModeVisibility(page, mode) {
+  const snapshot = await page.evaluate(() => ({
+    supportBadge: document.body.textContent?.includes("Режим помощи") ?? false,
+    callCode: document.body.textContent?.includes("код звонка") ?? false,
+    connectionPath: Boolean(document.querySelector("[data-testid='connection-path']")),
+  }))
+
+  if (mode === "relay") {
+    assert.equal(snapshot.supportBadge, true, "relay mode should expose support diagnostics")
+    assert.equal(snapshot.callCode, true, "relay mode should show call code")
+    return
+  }
+
+  assert.equal(snapshot.supportBadge, false, "default mode should hide support diagnostics")
+  assert.equal(snapshot.callCode, false, "default mode should hide call code")
+  assert.equal(snapshot.connectionPath, false, "default mode should hide connection path badge")
+}
+
 async function verifyInviteFlow(page, shareUrl, mode) {
-  await waitForStage(page, "Ждем второго участника")
+  await waitForStage(page, "Ждем собеседника")
 
   await page.evaluate(() => {
     window.__shareCallCount = 0
@@ -161,7 +178,7 @@ async function verifyInviteFlow(page, shareUrl, mode) {
 
 async function waitForConnected(page, label, expectedPath = null) {
   try {
-    await waitForStage(page, "Соединение активно", 30_000)
+    await waitForStage(page, "Можно разговаривать", 30_000)
 
     await page.waitForFunction(() => {
       const video = document.querySelector("[data-testid='remote-video']")
@@ -221,10 +238,12 @@ async function runScenario(browser, mode) {
     attachPageDebug(hostPage, `host:${mode}`)
     attachPageDebug(guestPage, `guest:${mode}`)
 
-    const expectedPath = mode === "relay" ? "TURN relay" : null
+    const expectedPath = mode === "relay" ? "Через запасной канал" : null
     await hostPage.goto(withIceTransport(created.hostUrl, mode), { waitUntil: "networkidle", timeout: 30_000 })
+    await assertSupportModeVisibility(hostPage, mode)
     await verifyInviteFlow(hostPage, created.shareUrl, mode)
     await guestPage.goto(withIceTransport(created.shareUrl, mode), { waitUntil: "networkidle", timeout: 30_000 })
+    await assertSupportModeVisibility(guestPage, mode)
 
     await Promise.all([
       waitForConnected(hostPage, `host:${mode}`, expectedPath),
@@ -250,10 +269,10 @@ async function runScenario(browser, mode) {
     await hostPage.getByTestId("remote-audio-muted").waitFor({ state: "hidden", timeout: 10_000 })
     console.log(`remote unmute indicator works (${mode})`)
 
-    await guestPage.getByRole("button", { name: "Покинуть сессию" }).click()
+    await guestPage.getByRole("button", { name: "Выйти из звонка" }).click()
     await hostPage.waitForFunction(() => {
       const el = document.querySelector("[data-testid='connection-stage']")
-      return el?.textContent?.includes("Ждем второго участника")
+      return el?.textContent?.includes("Ждем собеседника")
     }, undefined, { timeout: 15_000 })
     console.log(`leave flow works in browser (${mode})`)
   } finally {

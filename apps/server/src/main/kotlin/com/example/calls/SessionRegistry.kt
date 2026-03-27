@@ -78,10 +78,10 @@ class SessionRegistry(
             val role = roleForToken(session, joinToken)
             val canJoin = role != null && session.canAccept(role)
             val message = when {
-                role == null -> "Join token is invalid for this session."
+                role == null -> "Ссылка для входа больше не подходит. Попросите отправить приглашение еще раз."
                 session.status == SessionStatus.ENDED || session.status == SessionStatus.EXPIRED ->
-                    "This session has already ended."
-                !session.canAccept(role) -> "This session is already full."
+                    "Этот звонок уже завершен. Попросите отправить новую ссылку."
+                !session.canAccept(role) -> "В звонке уже два человека. Дождитесь, пока кто-то выйдет, или начните новый звонок."
                 else -> null
             }
 
@@ -105,22 +105,22 @@ class SessionRegistry(
     ): JoinResult {
         val joinResult = mutex.withLock {
             val session = sessions[sessionId]
-                ?: return@withLock JoinResult.Failure("session_not_found", "Session was not found.").also {
+                ?: return@withLock JoinResult.Failure("session_not_found", "Такой звонок не найден. Проверьте ссылку или попросите новое приглашение.").also {
                     logger.warn("Join rejected: session {} was not found", sessionId)
                 }
 
             if (session.status == SessionStatus.ENDED || session.status == SessionStatus.EXPIRED) {
-                return@withLock JoinResult.Failure("session_ended", "Session has already ended.").also {
+                return@withLock JoinResult.Failure("session_ended", "Этот звонок уже завершен. Попросите отправить новую ссылку.").also {
                     logger.warn("Join rejected: session {} already ended with status={}", sessionId, session.status)
                 }
             }
 
             val role = roleForToken(session, joinToken)
-                ?: return@withLock JoinResult.Failure("invalid_join_token", "Join token is invalid for this session.").also {
+                ?: return@withLock JoinResult.Failure("invalid_join_token", "Ссылка для входа больше не подходит. Попросите отправить приглашение еще раз.").also {
                     logger.warn("Join rejected: invalid token for session {}", sessionId)
                 }
             if (!session.canAccept(role)) {
-                return@withLock JoinResult.Failure("session_full", "Session is already full.").also {
+                return@withLock JoinResult.Failure("session_full", "В звонке уже два человека. Дождитесь, пока кто-то выйдет, или начните новый звонок.").also {
                     logger.warn("Join rejected: session {} is full for role={}", sessionId, role)
                 }
             }

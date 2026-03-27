@@ -168,6 +168,7 @@ class ApplicationTest {
         val response = client.get("/api/ice-servers?sessionId=${created.sessionId}&joinToken=bad-token")
 
         assertEquals(HttpStatusCode.Forbidden, response.status)
+        assertTrue(response.bodyAsText().contains("Ссылка для входа больше не подходит"))
     }
 
     @Test

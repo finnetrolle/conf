@@ -47,7 +47,7 @@ class SessionRegistryTest {
 
         assertNotNull(sessionInfo)
         assertFalse(sessionInfo.canJoin)
-        assertEquals("Join token is invalid for this session.", sessionInfo.message)
+        assertEquals("Ссылка для входа больше не подходит. Попросите отправить приглашение еще раз.", sessionInfo.message)
         assertNull(sessionInfo.shareUrl)
     }
 

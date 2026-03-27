@@ -101,23 +101,23 @@ fun Application.module(
 
             get("/sessions/{sessionId}") {
                 val sessionId = call.parameters["sessionId"]
-                    ?: return@get call.respond(HttpStatusCode.BadRequest, mapOf("message" to "Missing sessionId"))
+                    ?: return@get call.respond(HttpStatusCode.BadRequest, mapOf("message" to "Ссылка на звонок открыта не полностью. Откройте приглашение еще раз."))
                 val joinToken = call.request.queryParameters["joinToken"]
                 val sessionInfo = registry.getSessionInfo(sessionId, joinToken)
-                    ?: return@get call.respond(HttpStatusCode.NotFound, mapOf("message" to "Session not found"))
+                    ?: return@get call.respond(HttpStatusCode.NotFound, mapOf("message" to "Такой звонок не найден. Проверьте ссылку или попросите новое приглашение."))
                 call.respond(sessionInfo)
             }
 
             get("/ice-servers") {
                 val sessionId = call.request.queryParameters["sessionId"]
-                    ?: return@get call.respond(HttpStatusCode.BadRequest, mapOf("message" to "Missing sessionId"))
+                    ?: return@get call.respond(HttpStatusCode.BadRequest, mapOf("message" to "Ссылка на звонок открыта не полностью. Откройте приглашение еще раз."))
                 val joinToken = call.request.queryParameters["joinToken"]
-                    ?: return@get call.respond(HttpStatusCode.BadRequest, mapOf("message" to "Missing joinToken"))
+                    ?: return@get call.respond(HttpStatusCode.BadRequest, mapOf("message" to "Ссылка на звонок открыта не полностью. Откройте приглашение еще раз."))
 
                 val sessionInfo = registry.getSessionInfo(sessionId, joinToken)
-                    ?: return@get call.respond(HttpStatusCode.NotFound, mapOf("message" to "Session not found"))
+                    ?: return@get call.respond(HttpStatusCode.NotFound, mapOf("message" to "Такой звонок не найден. Проверьте ссылку или попросите новое приглашение."))
                 if (sessionInfo.role == null) {
-                    return@get call.respond(HttpStatusCode.Forbidden, mapOf("message" to "Join token is invalid for this session."))
+                    return@get call.respond(HttpStatusCode.Forbidden, mapOf("message" to "Ссылка для входа больше не подходит. Попросите отправить приглашение еще раз."))
                 }
                 if (!sessionInfo.canJoin) {
                     val status = when (sessionInfo.status) {
@@ -127,7 +127,7 @@ fun Application.module(
 
                         else -> HttpStatusCode.Conflict
                     }
-                    return@get call.respond(status, mapOf("message" to (sessionInfo.message ?: "ICE configuration is unavailable.")))
+                    return@get call.respond(status, mapOf("message" to (sessionInfo.message ?: "Не удалось подготовить звонок. Обновите страницу и попробуйте снова.")))
                 }
 
                 val iceServers = buildList {
@@ -210,7 +210,7 @@ fun Application.module(
                             val sessionId = joinedSessionId
                             val token = joinedToken
                             if (sessionId == null || token == null) {
-                                sendError("session_not_joined", "Join a session before sending signaling messages.")
+                                sendError("session_not_joined", "Сначала откройте звонок по ссылке, а потом повторите действие.")
                                 continue
                             }
                             registry.forward(sessionId, token, clientMessage.type, clientMessage.payload)
@@ -218,7 +218,7 @@ fun Application.module(
 
                         else -> {
                             this@module.environment.log.warn("Unsupported WebSocket event type={}", clientMessage.type)
-                            sendError("unsupported_event", "Unsupported event type: ${clientMessage.type}")
+                            sendError("unsupported_event", "Во время звонка произошла ошибка. Обновите страницу и попробуйте снова.")
                         }
                     }
                 }
