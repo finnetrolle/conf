@@ -1,6 +1,7 @@
 package com.example.calls
 
 import kotlinx.coroutines.runBlocking
+import java.time.Duration
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -20,11 +21,13 @@ class SessionRegistryTest {
         turnPort = 3478,
         turnTransport = "udp",
         turnAuthSecret = "webrtc-secret",
-        turnCredentialTtl = java.time.Duration.ofMinutes(60),
-        signalingReconnectGrace = java.time.Duration.ofMillis(250),
-        emptySessionGrace = java.time.Duration.ofSeconds(5),
-        endedSessionRetention = java.time.Duration.ofSeconds(5),
-        sessionMaxAge = java.time.Duration.ofHours(24),
+        turnCredentialTtl = Duration.ofMinutes(60),
+        signalingReconnectGrace = Duration.ofMillis(250),
+        waitingForPeerGrace = Duration.ofSeconds(5),
+        emptySessionGrace = Duration.ofSeconds(5),
+        endedSessionRetention = Duration.ofSeconds(5),
+        sessionMaxAge = Duration.ofHours(24),
+        sessionStorePath = null,
     )
 
     @Test
@@ -52,7 +55,7 @@ class SessionRegistryTest {
     }
 
     @Test
-    fun `cleanup ends and removes empty sessions after grace windows`() = runBlocking {
+    fun `cleanup expires unused sessions and removes them after retention`() = runBlocking {
         val registry = SessionRegistry(config, clock)
         val created = registry.createSession()
 
@@ -60,11 +63,151 @@ class SessionRegistryTest {
         registry.cleanup()
         val endedInfo = registry.getSessionInfo(created.sessionId, created.hostJoinToken)
         assertNotNull(endedInfo)
-        assertEquals(SessionStatus.ENDED, endedInfo.status)
+        assertEquals(SessionStatus.EXPIRED, endedInfo.status)
 
         clock.advanceSeconds(6)
         registry.cleanup()
         val removedInfo = registry.getSessionInfo(created.sessionId, created.hostJoinToken)
         assertEquals(null, removedInfo)
+    }
+
+    @Test
+    fun `restored overdue invite is immediately expired before cleanup runs`() = runBlocking {
+        val store = InMemorySessionStateStore(
+            initialSessions = listOf(
+                StoredSessionRecord(
+                    sessionId = "session_expired_on_restore",
+                    createdAt = "2026-03-24T23:59:50Z",
+                    hostUrl = "http://localhost:3000/session/session_expired_on_restore?joinToken=host-token",
+                    shareUrl = "http://localhost:3000/session/session_expired_on_restore?joinToken=guest-token",
+                    participants = listOf(
+                        StoredParticipantRecord(
+                            participantId = "participant_host",
+                            role = ParticipantRole.HOST,
+                            joinToken = "host-token",
+                        ),
+                        StoredParticipantRecord(
+                            participantId = "participant_guest",
+                            role = ParticipantRole.GUEST,
+                            joinToken = "guest-token",
+                        ),
+                    ),
+                    status = SessionStatus.WAITING_FOR_PEER,
+                    lastActivityAt = "2026-03-24T23:59:50Z",
+                    emptySince = "2026-03-24T23:59:50Z",
+                ),
+            ),
+        )
+
+        val registry = SessionRegistry.withStore(config, clock, store)
+
+        val sessionInfo = registry.getSessionInfo("session_expired_on_restore", "host-token")
+        assertNotNull(sessionInfo)
+        assertEquals(SessionStatus.EXPIRED, sessionInfo.status)
+        assertFalse(sessionInfo.canJoin)
+        assertEquals("Это приглашение устарело. Попросите отправить новую ссылку.", sessionInfo.message)
+    }
+
+    @Test
+    fun `cleanup expires a session that never reached webrtc answer`() = runBlocking {
+        val store = InMemorySessionStateStore(
+            initialSessions = listOf(
+                StoredSessionRecord(
+                    sessionId = "session_connecting_only",
+                    createdAt = "2026-03-24T23:59:50Z",
+                    hostUrl = "http://localhost:3000/session/session_connecting_only?joinToken=host-token",
+                    shareUrl = "http://localhost:3000/session/session_connecting_only?joinToken=guest-token",
+                    participants = listOf(
+                        StoredParticipantRecord(
+                            participantId = "participant_host",
+                            role = ParticipantRole.HOST,
+                            joinToken = "host-token",
+                            connectedAt = "2026-03-24T23:59:53Z",
+                            disconnectedAt = "2026-03-24T23:59:59Z",
+                        ),
+                        StoredParticipantRecord(
+                            participantId = "participant_guest",
+                            role = ParticipantRole.GUEST,
+                            joinToken = "guest-token",
+                            connectedAt = "2026-03-24T23:59:54Z",
+                            disconnectedAt = "2026-03-24T23:59:59Z",
+                        ),
+                    ),
+                    status = SessionStatus.CONNECTING,
+                    lastActivityAt = "2026-03-24T23:59:59Z",
+                    emptySince = "2026-03-24T23:59:59Z",
+                    callEstablishedAt = null,
+                ),
+            ),
+        )
+        val registry = SessionRegistry.withStore(config, clock, store)
+
+        clock.advanceSeconds(6)
+        registry.cleanup()
+
+        val sessionInfo = registry.getSessionInfo("session_connecting_only", "host-token")
+        assertNotNull(sessionInfo)
+        assertEquals(SessionStatus.EXPIRED, sessionInfo.status)
+        assertFalse(sessionInfo.canJoin)
+        assertEquals("Это приглашение устарело. Попросите отправить новую ссылку.", sessionInfo.message)
+    }
+
+    @Test
+    fun `cleanup ends a previously established call after rejoin window`() = runBlocking {
+        val store = InMemorySessionStateStore(
+            initialSessions = listOf(
+                StoredSessionRecord(
+                    sessionId = "session_test",
+                    createdAt = "2026-03-24T23:59:50Z",
+                    hostUrl = "http://localhost:3000/session/session_test?joinToken=host-token",
+                    shareUrl = "http://localhost:3000/session/session_test?joinToken=guest-token",
+                    participants = listOf(
+                        StoredParticipantRecord(
+                            participantId = "participant_host",
+                            role = ParticipantRole.HOST,
+                            joinToken = "host-token",
+                            connectedAt = "2026-03-24T23:59:53Z",
+                            disconnectedAt = "2026-03-24T23:59:59Z",
+                        ),
+                        StoredParticipantRecord(
+                            participantId = "participant_guest",
+                            role = ParticipantRole.GUEST,
+                            joinToken = "guest-token",
+                            connectedAt = "2026-03-24T23:59:54Z",
+                            disconnectedAt = "2026-03-24T23:59:59Z",
+                        ),
+                    ),
+                    status = SessionStatus.WAITING_FOR_PEER,
+                    lastActivityAt = "2026-03-24T23:59:59Z",
+                    emptySince = "2026-03-24T23:59:59Z",
+                    callEstablishedAt = "2026-03-24T23:59:54Z",
+                ),
+            ),
+        )
+        val registry = SessionRegistry.withStore(config, clock, store)
+
+        clock.advanceSeconds(6)
+        registry.cleanup()
+
+        val sessionInfo = registry.getSessionInfo("session_test", "host-token")
+        assertNotNull(sessionInfo)
+        assertEquals(SessionStatus.ENDED, sessionInfo.status)
+        assertFalse(sessionInfo.canJoin)
+        assertEquals("Этот звонок уже завершен. Попросите отправить новую ссылку.", sessionInfo.message)
+    }
+
+    @Test
+    fun `restores waiting session from durable store`() = runBlocking {
+        val store = InMemorySessionStateStore()
+        val firstRegistry = SessionRegistry.withStore(config, clock, store)
+        val created = firstRegistry.createSession()
+
+        val restoredRegistry = SessionRegistry.withStore(config, clock, store)
+        val restoredInfo = restoredRegistry.getSessionInfo(created.sessionId, created.hostJoinToken)
+
+        assertNotNull(restoredInfo)
+        assertEquals(SessionStatus.WAITING_FOR_PEER, restoredInfo.status)
+        assertTrue(restoredInfo.canJoin)
+        assertEquals(created.shareUrl, restoredInfo.shareUrl)
     }
 }

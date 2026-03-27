@@ -95,6 +95,10 @@ export function humanizeError(error: unknown) {
       return "Этот звонок уже завершен. Попросите отправить новую ссылку."
     }
 
+    if (/session has already expired|session_expired/i.test(rawMessage)) {
+      return "Это приглашение устарело. Попросите отправить новую ссылку."
+    }
+
     if (/session is already full|session_full/i.test(rawMessage)) {
       return "В звонке уже два человека. Дождитесь, пока кто-то выйдет, или начните новый звонок."
     }

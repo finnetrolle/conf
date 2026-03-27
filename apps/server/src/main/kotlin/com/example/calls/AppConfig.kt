@@ -15,9 +15,11 @@ data class AppConfig(
     val turnAuthSecret: String?,
     val turnCredentialTtl: Duration,
     val signalingReconnectGrace: Duration = Duration.ofSeconds(5),
+    val waitingForPeerGrace: Duration = Duration.ofMinutes(15),
     val emptySessionGrace: Duration,
     val endedSessionRetention: Duration,
     val sessionMaxAge: Duration,
+    val sessionStorePath: String? = "./data/session-store.json",
 )
 
 object AppConfigLoader {
@@ -41,9 +43,11 @@ object AppConfigLoader {
             turnAuthSecret = env["TURN_AUTH_SECRET"]?.trim()?.takeIf(String::isNotBlank),
             turnCredentialTtl = Duration.ofMinutes(env.getLong("TURN_CREDENTIAL_TTL_MINUTES", 60)),
             signalingReconnectGrace = Duration.ofSeconds(env.getLong("SIGNALING_RECONNECT_GRACE_SECONDS", 5)),
-            emptySessionGrace = Duration.ofSeconds(env.getLong("SESSION_EMPTY_GRACE_SECONDS", 10)),
+            waitingForPeerGrace = Duration.ofSeconds(env.getLong("SESSION_WAITING_FOR_PEER_GRACE_SECONDS", 900)),
+            emptySessionGrace = Duration.ofSeconds(env.getLong("SESSION_EMPTY_GRACE_SECONDS", 900)),
             endedSessionRetention = Duration.ofSeconds(env.getLong("SESSION_RETENTION_SECONDS", 300)),
             sessionMaxAge = Duration.ofHours(env.getLong("SESSION_MAX_AGE_HOURS", 24)),
+            sessionStorePath = env["SESSION_STORE_PATH"]?.trim()?.takeIf(String::isNotBlank) ?: "./data/session-store.json",
         )
     }
 

@@ -15,14 +15,40 @@ import java.time.Clock
 import java.time.Instant
 import java.util.Base64
 
-class SessionRegistry(
+class SessionRegistry private constructor(
     private val config: AppConfig,
-    private val clock: Clock = Clock.systemUTC(),
+    private val clock: Clock,
+    private val sessionStore: SessionStateStore,
 ) {
     private val logger = LoggerFactory.getLogger(SessionRegistry::class.java)
     private val mutex = Mutex()
     private val sessions = linkedMapOf<String, SessionRecord>()
     private val random = SecureRandom()
+
+    constructor(
+        config: AppConfig,
+        clock: Clock = Clock.systemUTC(),
+    ) : this(
+        config = config,
+        clock = clock,
+        sessionStore = SessionStateStore.fromConfig(config),
+    )
+
+    internal companion object {
+        fun withStore(
+            config: AppConfig,
+            clock: Clock = Clock.systemUTC(),
+            sessionStore: SessionStateStore,
+        ): SessionRegistry = SessionRegistry(
+            config = config,
+            clock = clock,
+            sessionStore = sessionStore,
+        )
+    }
+
+    init {
+        restorePersistedSessions()
+    }
 
     suspend fun createSession(publicAppUrl: String = config.publicAppUrl): CreateSessionResponse = mutex.withLock {
         val sessionId = randomId(prefix = "session")
@@ -56,6 +82,7 @@ class SessionRegistry(
         )
 
         sessions[sessionId] = session
+        persistLocked()
         logger.info(
             "Created session {} with publicAppUrl={} activeSessions={}",
             sessionId,
@@ -79,8 +106,10 @@ class SessionRegistry(
             val canJoin = role != null && session.canAccept(role)
             val message = when {
                 role == null -> "Ссылка для входа больше не подходит. Попросите отправить приглашение еще раз."
-                session.status == SessionStatus.ENDED || session.status == SessionStatus.EXPIRED ->
+                session.status == SessionStatus.ENDED ->
                     "Этот звонок уже завершен. Попросите отправить новую ссылку."
+                session.status == SessionStatus.EXPIRED ->
+                    "Это приглашение устарело. Попросите отправить новую ссылку."
                 !session.canAccept(role) -> "В звонке уже два человека. Дождитесь, пока кто-то выйдет, или начните новый звонок."
                 else -> null
             }
@@ -92,7 +121,7 @@ class SessionRegistry(
                 canJoin = canJoin,
                 activeParticipants = session.activeParticipantCount(),
                 maxParticipants = 2,
-                shareUrl = session.shareUrl.takeIf { role != null },
+                shareUrl = session.shareUrl.takeIf { role != null && !session.isTerminal() },
                 message = message,
             )
         }
@@ -109,9 +138,14 @@ class SessionRegistry(
                     logger.warn("Join rejected: session {} was not found", sessionId)
                 }
 
-            if (session.status == SessionStatus.ENDED || session.status == SessionStatus.EXPIRED) {
+            if (session.status == SessionStatus.ENDED) {
                 return@withLock JoinResult.Failure("session_ended", "Этот звонок уже завершен. Попросите отправить новую ссылку.").also {
                     logger.warn("Join rejected: session {} already ended with status={}", sessionId, session.status)
+                }
+            }
+            if (session.status == SessionStatus.EXPIRED) {
+                return@withLock JoinResult.Failure("session_expired", "Это приглашение устарело. Попросите отправить новую ссылку.").also {
+                    logger.warn("Join rejected: session {} already expired", sessionId)
                 }
             }
 
@@ -143,6 +177,7 @@ class SessionRegistry(
                 gracefulResume -> SessionStatus.ACTIVE
                 else -> SessionStatus.CONNECTING
             }
+            persistLocked()
             logger.info(
                 "Participant joined session={} role={} activeParticipants={} status={} gracefulResume={}",
                 sessionId,
@@ -231,6 +266,7 @@ class SessionRegistry(
         if (session.activeParticipantCount() == 0) {
             session.emptySince = disconnectedAt
         }
+        persistLocked()
         logger.info(
             "Participant signaling disconnected session={} role={} activeParticipants={} reconnectGraceUntil={}",
             sessionId,
@@ -259,6 +295,7 @@ class SessionRegistry(
             participant.reconnectGraceUntil = null
             session.lastActivityAt = now()
             session.status = SessionStatus.WAITING_FOR_PEER
+            persistLocked()
 
             val peer = session.peerOf(role)
             logger.info(
@@ -306,10 +343,16 @@ class SessionRegistry(
             session.lastActivityAt = now()
             if (type == "webrtc.answer") {
                 session.status = SessionStatus.ACTIVE
+                if (session.callEstablishedAt == null) {
+                    session.callEstablishedAt = now()
+                }
             }
             if (type == "media.state_changed") {
                 sender.audioEnabled = payload["audioEnabled"]?.toString()?.trim('"')?.toBooleanStrictOrNull() ?: sender.audioEnabled
                 sender.videoEnabled = payload["videoEnabled"]?.toString()?.trim('"')?.toBooleanStrictOrNull() ?: sender.videoEnabled
+            }
+            if (type == "webrtc.answer" || type == "media.state_changed") {
+                persistLocked()
             }
 
             if (!recipient.isActive()) {
@@ -386,6 +429,7 @@ class SessionRegistry(
             if (session.activeParticipantCount() == 0) {
                 session.emptySince = now()
             }
+            persistLocked()
             logger.info(
                 "Participant left session={} role={} activeParticipants={} status={} emptySince={}",
                 sessionId,
@@ -419,30 +463,8 @@ class SessionRegistry(
 
     suspend fun cleanup() {
         mutex.withLock {
-            val now = now()
-            val iterator = sessions.iterator()
-            while (iterator.hasNext()) {
-                val (_, session) = iterator.next()
-
-                if (session.endedAt != null && now.isAfter(session.endedAt!!.plus(config.endedSessionRetention))) {
-                    logger.info("Removing retained session {} with status={}", session.sessionId, session.status)
-                    iterator.remove()
-                    continue
-                }
-
-                val sessionExpired = now.isAfter(session.createdAt.plus(config.sessionMaxAge))
-                val emptyTooLong = session.emptySince?.let { now.isAfter(it.plus(config.emptySessionGrace)) } ?: false
-                if ((sessionExpired || emptyTooLong) && session.activeParticipantCount() == 0) {
-                    session.status = if (sessionExpired) SessionStatus.EXPIRED else SessionStatus.ENDED
-                    session.endedAt = now
-                    logger.info(
-                        "Marked session {} as {} sessionExpired={} emptyTooLong={}",
-                        session.sessionId,
-                        session.status,
-                        sessionExpired,
-                        emptyTooLong,
-                    )
-                }
+            if (applyLifecyclePolicy(now())) {
+                persistLocked()
             }
         }
     }
@@ -456,12 +478,21 @@ class SessionRegistry(
         participants.values.count { it.isActive() }
 
     private fun SessionRecord.canAccept(role: ParticipantRole): Boolean {
-        if (status == SessionStatus.ENDED || status == SessionStatus.EXPIRED) {
+        if (isTerminal()) {
             return false
         }
         val participant = participants.getValue(role)
         return participant.isActive() || activeParticipantCount() < 2
     }
+
+    private fun SessionRecord.idleGrace() =
+        if (callEstablishedAt == null) config.waitingForPeerGrace else config.emptySessionGrace
+
+    private fun SessionRecord.terminalStatus() =
+        if (callEstablishedAt == null) SessionStatus.EXPIRED else SessionStatus.ENDED
+
+    private fun SessionRecord.isTerminal(): Boolean =
+        status == SessionStatus.ENDED || status == SessionStatus.EXPIRED
 
     private fun SessionRecord.peerOf(role: ParticipantRole): ParticipantRecord =
         participants.getValue(if (role == ParticipantRole.HOST) ParticipantRole.GUEST else ParticipantRole.HOST)
@@ -480,6 +511,78 @@ class SessionRegistry(
     }
 
     private fun now(): Instant = Instant.now(clock)
+
+    private fun restorePersistedSessions() {
+        val restoredAt = now()
+        val restoredSessions = sessionStore.load()
+            .mapNotNull { storedSession -> storedSession.toSessionRecordOrNull(config, restoredAt, logger) }
+        restoredSessions.forEach { session ->
+            sessions[session.sessionId] = session
+        }
+
+        val lifecycleChanged = applyLifecyclePolicy(restoredAt)
+
+        if (sessions.isNotEmpty()) {
+            logger.info("Restored {} sessions from durable storage", sessions.size)
+        }
+
+        if (restoredSessions.isNotEmpty() || lifecycleChanged) {
+            persistLocked()
+        }
+    }
+
+    private fun persistLocked() {
+        sessionStore.save(sessions.values.map(SessionRecord::toStoredSnapshot))
+    }
+
+    private fun applyLifecyclePolicy(referenceTime: Instant): Boolean {
+        val iterator = sessions.iterator()
+        var changed = false
+        while (iterator.hasNext()) {
+            val (_, session) = iterator.next()
+
+            if (session.isTerminal()) {
+                if (session.endedAt == null) {
+                    session.endedAt = referenceTime
+                    changed = true
+                }
+
+                if (referenceTime.isAfter(session.endedAt!!.plus(config.endedSessionRetention))) {
+                    logger.info("Removing retained session {} with status={}", session.sessionId, session.status)
+                    iterator.remove()
+                    changed = true
+                }
+                continue
+            }
+
+            if (session.activeParticipantCount() > 0) {
+                continue
+            }
+
+            val sessionExpired = referenceTime.isAfter(session.createdAt.plus(config.sessionMaxAge))
+            val idleDeadline = session.emptySince?.plus(session.idleGrace())
+            val idleTooLong = idleDeadline?.let(referenceTime::isAfter) ?: false
+            if (sessionExpired || idleTooLong) {
+                session.status = session.terminalStatus()
+                session.endedAt = referenceTime
+                session.lastActivityAt = referenceTime
+                session.participants.values.forEach { participant ->
+                    participant.reconnectGraceUntil = null
+                }
+                changed = true
+                logger.info(
+                    "Marked session {} as {} sessionExpired={} idleTooLong={} callEstablished={}",
+                    session.sessionId,
+                    session.status,
+                    sessionExpired,
+                    idleTooLong,
+                    session.callEstablishedAt != null,
+                )
+            }
+        }
+
+        return changed
+    }
 
     private fun candidateTypeOf(candidateJson: String): String {
         val candidate = candidateJson.substringAfter("\"candidate\":\"", missingDelimiterValue = candidateJson)

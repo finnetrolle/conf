@@ -19,7 +19,8 @@
 ### `GET /api/sessions/{sessionId}?joinToken=...`
 
 Возвращает метаданные сессии и возможность входа для конкретного токена.
-`shareUrl` возвращается только для валидного `joinToken`.
+Статус может быть `waiting_for_peer`, `connecting`, `active`, `ended` или `expired`.
+`shareUrl` возвращается только для валидного `joinToken` и пока приглашение еще можно повторно отправить.
 
 ### `GET /api/ice-servers?sessionId=...&joinToken=...`
 
@@ -38,6 +39,20 @@
 ```json
 {
   "type": "session.join",
+  "payload": {
+    "sessionId": "session_abc123",
+    "joinToken": "guest_token"
+  }
+}
+```
+
+#### `session.resume`
+
+Повторный вход в ту же сессию после краткого обрыва signaling или рестарта сервера.
+
+```json
+{
+  "type": "session.resume",
   "payload": {
     "sessionId": "session_abc123",
     "joinToken": "guest_token"
@@ -159,8 +174,8 @@
 {
   "type": "error",
   "payload": {
-    "code": "invalid_join_token",
-    "message": "Join token is invalid for this session."
+    "code": "session_expired",
+    "message": "Это приглашение устарело. Попросите отправить новую ссылку."
   }
 }
 ```

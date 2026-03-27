@@ -91,6 +91,7 @@ const stageCopy: Record<ConnectionStage, { label: string; badge: "amber" | "blue
   connected: { label: "Можно разговаривать", badge: "green" },
   reconnecting: { label: "Возвращаем звонок", badge: "amber" },
   ended: { label: "Звонок завершен", badge: "slate" },
+  expired: { label: "Приглашение устарело", badge: "slate" },
   failed: { label: "Связь недоступна", badge: "rose" },
 }
 
@@ -1192,19 +1193,19 @@ export function SessionPage() {
           typeof message.payload.message === "string"
             ? message.payload.message
             : "Во время звонка произошла ошибка. Обновите страницу и попробуйте снова."
-        const isTerminalSessionError = ["invalid_join_token", "session_not_found", "session_full", "session_ended"].includes(code)
+        const isTerminalSessionError = ["invalid_join_token", "session_not_found", "session_full", "session_ended", "session_expired"].includes(code)
         reconnectEnabledRef.current = !isTerminalSessionError
         if (isTerminalSessionError) {
           patchSessionInfo({
             canJoin: false,
             shareUrl: null,
-            status: code === "session_ended" ? "ended" : sessionInfoRef.current?.status,
+            status: code === "session_ended" ? "ended" : code === "session_expired" ? "expired" : sessionInfoRef.current?.status,
             message: messageText,
           })
         }
         setStatusNote(null)
         setErrorMessage(messageText)
-        setConnectionStage(code === "session_ended" ? "ended" : "failed")
+        setConnectionStage(code === "session_ended" ? "ended" : code === "session_expired" ? "expired" : "failed")
         break
       }
       default:
@@ -1270,7 +1271,7 @@ export function SessionPage() {
       if (webSocketRef.current === socket) {
         webSocketRef.current = null
       }
-      if (!leavingRef.current && connectionStageRef.current !== "ended") {
+      if (!leavingRef.current && connectionStageRef.current !== "ended" && connectionStageRef.current !== "expired") {
         scheduleSocketReconnect(currentSessionId, currentJoinToken)
       }
     }
@@ -1585,7 +1586,7 @@ export function SessionPage() {
 
         if (!session.canJoin || !session.role) {
           setStatusNote(null)
-          setConnectionStage(session.status === "ended" || session.status === "expired" ? "ended" : "failed")
+          setConnectionStage(session.status === "expired" ? "expired" : session.status === "ended" ? "ended" : "failed")
           setErrorMessage(session.message ?? "Этот звонок сейчас недоступен. Попросите отправить новое приглашение.")
           return
         }
@@ -1854,6 +1855,8 @@ export function SessionPage() {
   const remoteWaitingTitle =
     connectionStage === "ended"
       ? "Звонок завершен"
+      : connectionStage === "expired"
+        ? "Приглашение устарело"
       : connectionStage === "failed"
         ? "Подключиться не получилось"
         : connectionStage === "reconnecting"
@@ -1864,6 +1867,8 @@ export function SessionPage() {
   const remoteWaitingDescription =
     connectionStage === "reconnecting"
       ? "Связь ненадолго прервалась. Пытаемся продолжить разговор без перезагрузки страницы."
+      : connectionStage === "expired"
+        ? "Срок действия этой ссылки закончился. Начните новый звонок или попросите отправить новое приглашение."
       : connectionStage === "ended" || connectionStage === "failed"
         ? "По этой ссылке сейчас нельзя подключиться. Начните новый звонок или попросите отправить новое приглашение."
       : connectionStage === "connecting"

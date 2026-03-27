@@ -123,6 +123,7 @@ internal data class SessionRecord(
     var lastActivityAt: Instant,
     var emptySince: Instant? = null,
     var endedAt: Instant? = null,
+    var callEstablishedAt: Instant? = null,
 )
 
 internal data class OutboundMessage(

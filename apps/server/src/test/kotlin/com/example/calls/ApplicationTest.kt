@@ -14,6 +14,8 @@ import io.ktor.websocket.Frame
 import io.ktor.websocket.CloseReason
 import io.ktor.websocket.readText
 import kotlinx.coroutines.withTimeoutOrNull
+import java.nio.file.Files
+import java.time.Duration
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -34,11 +36,13 @@ class ApplicationTest {
         turnPort = 3478,
         turnTransport = "udp",
         turnAuthSecret = "webrtc-secret",
-        turnCredentialTtl = java.time.Duration.ofMinutes(60),
-        signalingReconnectGrace = java.time.Duration.ofMillis(250),
-        emptySessionGrace = java.time.Duration.ofSeconds(5),
-        endedSessionRetention = java.time.Duration.ofSeconds(5),
-        sessionMaxAge = java.time.Duration.ofHours(24),
+        turnCredentialTtl = Duration.ofMinutes(60),
+        signalingReconnectGrace = Duration.ofMillis(250),
+        waitingForPeerGrace = Duration.ofSeconds(5),
+        emptySessionGrace = Duration.ofSeconds(5),
+        endedSessionRetention = Duration.ofSeconds(5),
+        sessionMaxAge = Duration.ofHours(24),
+        sessionStorePath = null,
     )
 
     @Test
@@ -312,5 +316,39 @@ class ApplicationTest {
 
         resumedGuestSession.send(Frame.Close(CloseReason(CloseReason.Codes.NORMAL, "Test complete")))
         hostSession.send(Frame.Close(CloseReason(CloseReason.Codes.NORMAL, "Test complete")))
+    }
+
+    @Test
+    fun `session metadata survives app restart through durable store`() {
+        val tempDirectory = Files.createTempDirectory("calls-session-store")
+        val persistentConfig = config.copy(
+            waitingForPeerGrace = Duration.ofSeconds(30),
+            sessionStorePath = tempDirectory.resolve("sessions.json").toString(),
+        )
+
+        lateinit var created: CreateSessionResponse
+
+        testApplication {
+            application {
+                module(config = persistentConfig, enableCleanupLoop = false)
+            }
+
+            val response = client.post("/api/sessions")
+            created = JsonSupport.json.decodeFromString(CreateSessionResponse.serializer(), response.bodyAsText())
+        }
+
+        testApplication {
+            application {
+                module(config = persistentConfig, enableCleanupLoop = false)
+            }
+
+            val response = client.get("/api/sessions/${created.sessionId}?joinToken=${created.hostJoinToken}")
+            assertEquals(HttpStatusCode.OK, response.status)
+
+            val restored = JsonSupport.json.decodeFromString(SessionInfoResponse.serializer(), response.bodyAsText())
+            assertEquals(SessionStatus.WAITING_FOR_PEER, restored.status)
+            assertTrue(restored.canJoin)
+            assertEquals(created.shareUrl, restored.shareUrl)
+        }
     }
 }

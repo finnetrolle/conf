@@ -1,6 +1,6 @@
 export type SessionStatus = "waiting_for_peer" | "connecting" | "active" | "ended" | "expired"
 export type ParticipantRole = "host" | "guest"
-export type ConnectionStage = "loading" | "preparing" | "waiting" | "connecting" | "connected" | "reconnecting" | "ended" | "failed"
+export type ConnectionStage = "loading" | "preparing" | "waiting" | "connecting" | "connected" | "reconnecting" | "ended" | "expired" | "failed"
 export type ConnectionPath = "unknown" | "direct" | "relay"
 
 export interface CreateSessionResponse {

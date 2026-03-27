@@ -19,6 +19,7 @@ coverage/
 # App-specific generated files
 apps/server/.gradle/
 apps/server/build/
+apps/server/data/
 apps/web/node_modules/
 apps/web/dist/
 apps/web/vite.config.js
