@@ -58,13 +58,110 @@ async function readConnectionPath(page, required = false) {
   })
 }
 
+async function waitForStage(page, expectedText, timeout = 20_000) {
+  await page.getByTestId("connection-stage").waitFor({ state: "visible", timeout })
+  await page.waitForFunction((text) => {
+    const el = document.querySelector("[data-testid='connection-stage']")
+    return el?.textContent?.includes(text)
+  }, expectedText, { timeout })
+}
+
+async function verifyInviteFlow(page, shareUrl, mode) {
+  await waitForStage(page, "Ждем второго участника")
+
+  await page.evaluate(() => {
+    window.__shareCallCount = 0
+    Object.defineProperty(navigator, "canShare", {
+      configurable: true,
+      value: () => true,
+    })
+
+    Object.defineProperty(navigator, "share", {
+      configurable: true,
+      value: async () => {
+        window.__shareCallCount += 1
+      },
+    })
+  })
+
+  await page.getByRole("button", { name: "Отправить приглашение" }).click()
+  await page.waitForFunction(() => window.__shareCallCount === 1, undefined, { timeout: 5_000 })
+  await page.waitForFunction(() => !document.querySelector("[role='dialog']"), undefined, { timeout: 5_000 })
+
+  await page.evaluate(() => {
+    Object.defineProperty(navigator, "share", {
+      configurable: true,
+      value: async () => {
+        throw new DOMException("User aborted share", "AbortError")
+      },
+    })
+  })
+
+  await page.getByRole("button", { name: "Отправить приглашение" }).click()
+
+  const dialog = page.getByRole("dialog", { name: "Отправить приглашение" })
+  await dialog.waitFor({ state: "visible", timeout: 10_000 })
+  await dialog.getByText("Отправка отменена. Можно выбрать другой способ приглашения ниже.").waitFor({
+    state: "visible",
+    timeout: 10_000,
+  })
+
+  const whatsAppHref = await dialog.getByRole("link", { name: /WhatsApp/ }).getAttribute("href")
+  assert.ok(
+    whatsAppHref?.includes(encodeURIComponent(shareUrl)),
+    `WhatsApp invite link should include encoded share url (${mode})`,
+  )
+
+  const telegramHref = await dialog.getByRole("link", { name: /Telegram/ }).getAttribute("href")
+  assert.ok(
+    telegramHref?.includes(encodeURIComponent(shareUrl)),
+    `Telegram invite link should include encoded share url (${mode})`,
+  )
+
+  const smsHref = await dialog.getByRole("link", { name: /SMS/ }).getAttribute("href")
+  assert.match(smsHref ?? "", /^sms:/, `SMS invite link should use sms: protocol (${mode})`)
+  assert.ok(
+    smsHref?.includes(encodeURIComponent(shareUrl)),
+    `SMS invite link should include encoded share url (${mode})`,
+  )
+
+  const emailHref = await dialog.getByRole("link", { name: /E-mail/ }).getAttribute("href")
+  assert.match(emailHref ?? "", /^mailto:/, `Email invite link should use mailto: protocol (${mode})`)
+  assert.ok(
+    emailHref?.includes(encodeURIComponent(shareUrl)),
+    `Email invite link should include encoded share url (${mode})`,
+  )
+
+  const qrImage = dialog.getByAltText("QR-код приглашения на видеозвонок")
+  await qrImage.waitFor({ state: "visible", timeout: 10_000 })
+  const qrSrc = await qrImage.getAttribute("src")
+  assert.match(qrSrc ?? "", /^data:image\/png;base64,/, `QR code should be rendered as a data URL (${mode})`)
+
+  await dialog.getByRole("button", { name: "Скопировать ссылку" }).click()
+  await page.waitForFunction(async (expectedValue) => {
+    return (await navigator.clipboard.readText()) === expectedValue
+  }, shareUrl, { timeout: 5_000 })
+  await dialog.getByText("Ссылка для подключения скопирована.").waitFor({ state: "visible", timeout: 5_000 })
+
+  await dialog.getByRole("button", { name: "Закрыть панель приглашения" }).click()
+  await dialog.waitFor({ state: "hidden", timeout: 5_000 })
+
+  await page.getByRole("button", { name: /Скопировать ссылку|Ссылка скопирована/ }).click()
+  const feedbackToast = page.getByTestId("invite-feedback-toast")
+  await feedbackToast.waitFor({ state: "visible", timeout: 5_000 })
+  const feedbackText = (await feedbackToast.textContent())?.trim() ?? ""
+  assert.match(
+    feedbackText,
+    /Ссылка для подключения скопирована\./,
+    `Top-level copy fallback should show visible feedback (${mode})`,
+  )
+
+  console.log(`invite flow works in browser (${mode})`)
+}
+
 async function waitForConnected(page, label, expectedPath = null) {
   try {
-    await page.getByTestId("connection-stage").waitFor({ state: "visible", timeout: 20_000 })
-    await page.waitForFunction(() => {
-      const el = document.querySelector("[data-testid='connection-stage']")
-      return el?.textContent?.includes("Соединение активно")
-    }, undefined, { timeout: 30_000 })
+    await waitForStage(page, "Соединение активно", 30_000)
 
     await page.waitForFunction(() => {
       const video = document.querySelector("[data-testid='remote-video']")
@@ -126,12 +223,24 @@ async function runScenario(browser, mode) {
 
     const expectedPath = mode === "relay" ? "TURN relay" : null
     await hostPage.goto(withIceTransport(created.hostUrl, mode), { waitUntil: "networkidle", timeout: 30_000 })
+    await verifyInviteFlow(hostPage, created.shareUrl, mode)
     await guestPage.goto(withIceTransport(created.shareUrl, mode), { waitUntil: "networkidle", timeout: 30_000 })
 
     await Promise.all([
       waitForConnected(hostPage, `host:${mode}`, expectedPath),
       waitForConnected(guestPage, `guest:${mode}`, expectedPath),
     ])
+
+    assert.equal(
+      await hostPage.getByRole("button", { name: "Отправить приглашение" }).isDisabled(),
+      true,
+      `host invite should be disabled when the call is full (${mode})`,
+    )
+    assert.equal(
+      await guestPage.getByRole("button", { name: "Отправить приглашение" }).isDisabled(),
+      true,
+      `guest invite should be disabled when the call is full (${mode})`,
+    )
 
     await guestPage.getByRole("button", { name: "Выключить микрофон" }).click()
     await hostPage.getByTestId("remote-audio-muted").waitFor({ state: "visible", timeout: 10_000 })

@@ -1,7 +1,7 @@
 import {
   ArrowRight,
-  Copy,
   Link2,
+  Share2,
   ShieldCheck,
   Sparkles,
   TimerReset,
@@ -24,16 +24,16 @@ const steps = [
     text: "Камера, микрофон и локальное превью доступны сразу, без отдельного мастера настройки.",
   },
   {
-    icon: Copy,
-    title: "Отправить ссылку",
-    text: "Второй участник заходит по ссылке и попадает в тот же интерфейс без лишних переходов.",
+    icon: Share2,
+    title: "Отправить приглашение",
+    text: "Мессенджеры, SMS, системный share и QR-код помогают подключить второго участника в один шаг.",
   },
 ]
 
 const highlights = [
   {
-    value: "1 ссылка",
-    label: "достаточно, чтобы оба участника попали в один звонок",
+    value: "1 приглашение",
+    label: "достаточно, чтобы второй участник открыл тот же звонок без лишних объяснений",
   },
   {
     value: "1 экран",
@@ -106,13 +106,13 @@ export function LandingPage() {
                 <h1 className="max-w-4xl font-display text-5xl font-bold leading-[0.92] text-slate-950 md:text-7xl">
                   Один быстрый звонок.
                   <br />
-                  Одна ссылка.
+                  Одно приглашение.
                   <br />
                   Ни одного лишнего шага.
                 </h1>
                 <p className="max-w-2xl text-lg leading-8 text-slate-600 sm:text-[1.15rem]">
-                  Открываешь страницу, создаешь сессию и сразу попадаешь в звонок. Второй участник подключается по
-                  ссылке в тот же интерфейс без регистрации и промежуточных экранов.
+                  Открываешь страницу, создаешь сессию и сразу попадаешь в звонок. Второй участник получает понятное
+                  приглашение, открывает ссылку или QR и попадает в тот же интерфейс без регистрации и промежуточных экранов.
                 </p>
               </div>
 
@@ -127,7 +127,7 @@ export function LandingPage() {
                   <ArrowRight className="h-4 w-4" />
                 </Button>
                 <p className="max-w-xs text-sm leading-6 text-slate-500">
-                  После создания ты сразу попадешь в звонок и сможешь скопировать ссылку для второго участника.
+                  После создания ты сразу попадешь в звонок и сможешь отправить приглашение второму участнику удобным способом.
                 </p>
               </div>
 
@@ -195,7 +195,7 @@ export function LandingPage() {
                     <div className="rounded-[24px] border border-white/12 bg-white px-4 py-4 text-slate-950">
                       <p className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">Внутри звонка</p>
                       <p className="mt-2 text-sm font-medium leading-6">
-                        Ссылка копируется одной кнопкой прямо из интерфейса видеосвязи.
+                        Приглашение отправляется одной кнопкой прямо из интерфейса видеосвязи.
                       </p>
                     </div>
                     <div className="rounded-[24px] border border-white/12 bg-sky-100 px-4 py-4 text-slate-950">
@@ -216,7 +216,7 @@ export function LandingPage() {
             <p className="text-xs font-semibold uppercase tracking-[0.24em] text-slate-400">Для быстрых созвонов</p>
             <h3 className="mt-4 max-w-lg font-display text-3xl leading-tight">Когда нужно просто созвониться, интерфейс не должен мешать.</h3>
             <p className="mt-4 max-w-xl text-sm leading-7 text-slate-300">
-              Сервис оставляет только ключевые действия: создать сессию, проверить устройства, отправить ссылку и
+              Сервис оставляет только ключевые действия: создать сессию, отправить приглашение, проверить устройства и
               завершить встречу без лишних сущностей вокруг.
             </p>
           </div>

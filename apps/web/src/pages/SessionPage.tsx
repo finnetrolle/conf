@@ -1,4 +1,25 @@
-import { Camera, CameraOff, Copy, Eye, LoaderCircle, Mic, MicOff, PhoneOff, Settings2, X } from "lucide-react"
+import {
+  CircleAlert,
+  Camera,
+  CameraOff,
+  Check,
+  Copy,
+  ExternalLink,
+  Eye,
+  Link2,
+  LoaderCircle,
+  Mail,
+  MessageCircle,
+  MessageSquare,
+  Mic,
+  MicOff,
+  PhoneOff,
+  QrCode,
+  Send,
+  Settings2,
+  Share2,
+  X,
+} from "lucide-react"
 import { type ChangeEvent, useEffect, useMemo, useRef, useState } from "react"
 import { useLocation, useNavigate, useParams } from "react-router-dom"
 import { Badge } from "@/components/ui/badge"
@@ -53,6 +74,11 @@ type CandidatePairStatsLike = RTCStats & {
 
 type CandidateStatsLike = RTCStats & {
   candidateType?: string
+}
+
+type InviteActionFeedback = {
+  tone: "success" | "error" | "info"
+  message: string
 }
 
 const defaultMediaState: MediaState = { audioEnabled: true, videoEnabled: true }
@@ -197,6 +223,95 @@ function fallbackDevicesFromStream(stream: MediaStream | null): DeviceLists {
   }
 }
 
+const focusableDialogSelector = [
+  "a[href]",
+  "button:not([disabled])",
+  "textarea:not([disabled])",
+  "input:not([disabled])",
+  "select:not([disabled])",
+  "[tabindex]:not([tabindex='-1'])",
+].join(",")
+
+function getFocusableElements(container: HTMLElement) {
+  return Array.from(container.querySelectorAll<HTMLElement>(focusableDialogSelector)).filter(
+    (element) => !element.hasAttribute("disabled") && element.getClientRects().length > 0,
+  )
+}
+
+function buildInviteCopy(shareUrl: string, sessionLabel: string) {
+  const sessionHint = sessionLabel === "unknown" ? "" : ` к сессии ${sessionLabel}`
+  const title = "Приглашение на видеозвонок"
+  const text = `Вас приглашают на видеозвонок. Откройте ссылку, чтобы сразу подключиться${sessionHint}.`
+
+  return {
+    title,
+    subject: title,
+    text,
+    message: `${text}\n\n${shareUrl}`,
+    shareUrl,
+  }
+}
+
+function buildSmsHref(message: string) {
+  return `sms:?&body=${encodeURIComponent(message)}`
+}
+
+function isIosDevice() {
+  if (typeof navigator === "undefined") {
+    return false
+  }
+
+  return /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.userAgent.includes("Mac") && navigator.maxTouchPoints > 1)
+}
+
+function canUseNativeShare(data: ShareData) {
+  if (typeof navigator === "undefined" || typeof navigator.share !== "function") {
+    return false
+  }
+
+  if (typeof navigator.canShare === "function") {
+    try {
+      return navigator.canShare(data)
+    } catch {
+      return false
+    }
+  }
+
+  return true
+}
+
+function isShareAbort(error: unknown) {
+  return error instanceof DOMException && error.name === "AbortError"
+}
+
+async function writeTextToClipboard(value: string) {
+  if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value)
+    return
+  }
+
+  if (typeof document === "undefined") {
+    throw new Error("Clipboard API недоступен в текущем окружении.")
+  }
+
+  const textarea = document.createElement("textarea")
+  textarea.value = value
+  textarea.setAttribute("readonly", "")
+  textarea.style.position = "fixed"
+  textarea.style.opacity = "0"
+  textarea.style.pointerEvents = "none"
+  document.body.appendChild(textarea)
+  textarea.focus()
+  textarea.select()
+
+  const copied = document.execCommand("copy")
+  document.body.removeChild(textarea)
+
+  if (!copied) {
+    throw new Error("Не удалось скопировать текст.")
+  }
+}
+
 export function SessionPage() {
   const navigate = useNavigate()
   const { sessionId } = useParams<{ sessionId: string }>()
@@ -209,7 +324,11 @@ export function SessionPage() {
   const [connectionStage, setConnectionStage] = useState<ConnectionStage>("loading")
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
   const [statusNote, setStatusNote] = useState<string | null>(null)
-  const [copyLabel, setCopyLabel] = useState("Ссылка на сессию")
+  const [copyLinkLabel, setCopyLinkLabel] = useState("Скопировать ссылку")
+  const [isInvitePanelVisible, setIsInvitePanelVisible] = useState(false)
+  const [inviteActionFeedback, setInviteActionFeedback] = useState<InviteActionFeedback | null>(null)
+  const [inviteQrCodeUrl, setInviteQrCodeUrl] = useState<string | null>(null)
+  const [inviteQrCodeError, setInviteQrCodeError] = useState<string | null>(null)
   const [devices, setDevices] = useState<DeviceLists>({ audioInputs: [], videoInputs: [], audioOutputs: [] })
   const [selectedVideoDeviceId, setSelectedVideoDeviceId] = useState("")
   const [selectedAudioDeviceId, setSelectedAudioDeviceId] = useState("")
@@ -243,6 +362,10 @@ export function SessionPage() {
   const reconnectTimeoutRef = useRef<number | null>(null)
   const connectionPathTimeoutRef = useRef<number | null>(null)
   const iceRefreshTimeoutRef = useRef<number | null>(null)
+  const copyLinkResetTimeoutRef = useRef<number | null>(null)
+  const inviteFeedbackResetTimeoutRef = useRef<number | null>(null)
+  const inviteDialogRef = useRef<HTMLDivElement>(null)
+  const previousFocusedElementRef = useRef<HTMLElement | null>(null)
   const reconnectAttemptRef = useRef(0)
   const reconnectEnabledRef = useRef(true)
   const turnCredentialExpiryRef = useRef<number | null>(null)
@@ -278,6 +401,30 @@ export function SessionPage() {
       window.clearTimeout(iceRefreshTimeoutRef.current)
       iceRefreshTimeoutRef.current = null
     }
+  }
+
+  function clearCopyLinkResetTimer() {
+    if (copyLinkResetTimeoutRef.current !== null) {
+      window.clearTimeout(copyLinkResetTimeoutRef.current)
+      copyLinkResetTimeoutRef.current = null
+    }
+  }
+
+  function clearInviteFeedbackResetTimer() {
+    if (inviteFeedbackResetTimeoutRef.current !== null) {
+      window.clearTimeout(inviteFeedbackResetTimeoutRef.current)
+      inviteFeedbackResetTimeoutRef.current = null
+    }
+  }
+
+  function patchSessionInfo(patch: Partial<SessionInfoResponse>) {
+    if (!sessionInfoRef.current) {
+      return
+    }
+
+    const nextSessionInfo = { ...sessionInfoRef.current, ...patch }
+    sessionInfoRef.current = nextSessionInfo
+    setSessionInfo(nextSessionInfo)
   }
 
   function hasReusablePeerConnection(peerConnection: RTCPeerConnection | null = peerConnectionRef.current) {
@@ -938,9 +1085,13 @@ export function SessionPage() {
         setRole(nextRole)
         const peerPresent = Boolean(message.payload.peerPresent)
         const shouldCreateOffer = Boolean(message.payload.shouldCreateOffer)
+        const activeParticipants = Number(message.payload.activeParticipants)
         const canReusePeerConnection = hasReusablePeerConnection()
         setErrorMessage(null)
         setStatusNote(null)
+        if (Number.isFinite(activeParticipants)) {
+          patchSessionInfo({ activeParticipants })
+        }
 
         if (resumed && peerPresent && canReusePeerConnection) {
           setRemoteConnected(
@@ -982,6 +1133,10 @@ export function SessionPage() {
         break
       }
       case "participant.joined": {
+        const activeParticipants = Number(message.payload.activeParticipants)
+        if (Number.isFinite(activeParticipants)) {
+          patchSessionInfo({ activeParticipants })
+        }
         setStatusNote(null)
         setConnectionStage("connecting")
         if (roleRef.current === "host") {
@@ -991,6 +1146,10 @@ export function SessionPage() {
         break
       }
       case "participant.left": {
+        const activeParticipants = Number(message.payload.activeParticipants)
+        if (Number.isFinite(activeParticipants)) {
+          patchSessionInfo({ activeParticipants })
+        }
         await resetPeerConnection(true)
         setErrorMessage(null)
         setStatusNote("Собеседник вышел из звонка. Сессия остается открытой, можно дождаться повторного входа по той же ссылке.")
@@ -1026,7 +1185,16 @@ export function SessionPage() {
       case "error": {
         const code = typeof message.payload.code === "string" ? message.payload.code : "unknown_error"
         const messageText = typeof message.payload.message === "string" ? message.payload.message : "Не удалось обработать signaling-событие."
-        reconnectEnabledRef.current = !["invalid_join_token", "session_not_found", "session_full", "session_ended"].includes(code)
+        const isTerminalSessionError = ["invalid_join_token", "session_not_found", "session_full", "session_ended"].includes(code)
+        reconnectEnabledRef.current = !isTerminalSessionError
+        if (isTerminalSessionError) {
+          patchSessionInfo({
+            canJoin: false,
+            shareUrl: null,
+            status: code === "session_ended" ? "ended" : sessionInfoRef.current?.status,
+            message: messageText,
+          })
+        }
         setStatusNote(null)
         setErrorMessage(messageText)
         setConnectionStage(code === "session_ended" ? "ended" : "failed")
@@ -1109,14 +1277,172 @@ export function SessionPage() {
     sendSocketMessage("media.state_changed", nextState)
   }
 
-  async function handleCopyLink() {
-    if (!sessionInfoRef.current?.shareUrl) {
+  function openInvitePanel() {
+    if (!isInviteAvailable) {
       return
     }
 
-    await navigator.clipboard.writeText(sessionInfoRef.current.shareUrl)
-    setCopyLabel("Ссылка скопирована")
-    window.setTimeout(() => setCopyLabel("Ссылка на сессию"), 1600)
+    clearInviteFeedbackResetTimer()
+    setIsSettingsVisible(false)
+    setInviteActionFeedback(null)
+    setIsInvitePanelVisible(true)
+  }
+
+  function closeInvitePanel() {
+    clearInviteFeedbackResetTimer()
+    setInviteActionFeedback(null)
+    setIsInvitePanelVisible(false)
+  }
+
+  async function tryNativeShare() {
+    if (!nativeShareData || !canUseNativeShare(nativeShareData)) {
+      return {
+        shared: false,
+        cancelled: false,
+        errorMessage: null as string | null,
+      }
+    }
+
+    try {
+      await navigator.share(nativeShareData)
+      return {
+        shared: true,
+        cancelled: false,
+        errorMessage: null as string | null,
+      }
+    } catch (error) {
+      if (isShareAbort(error)) {
+        return {
+          shared: false,
+          cancelled: true,
+          errorMessage: "Отправка отменена. Можно выбрать другой способ приглашения ниже.",
+        }
+      }
+
+      console.warn("Native share failed", error)
+      return {
+        shared: false,
+        cancelled: false,
+        errorMessage: "Не удалось открыть системное меню отправки.",
+      }
+    }
+  }
+
+  async function handleShareInvite() {
+    if (!inviteMeta || !isInviteAvailable) {
+      return
+    }
+
+    setInviteActionFeedback(null)
+    const shareAttempt = nativeShareAvailable
+      ? await tryNativeShare()
+      : { shared: false, cancelled: false, errorMessage: null as string | null }
+
+    if (!shareAttempt.shared) {
+      openInvitePanel()
+      if (shareAttempt.errorMessage) {
+        setInviteActionFeedback({
+          tone: shareAttempt.cancelled ? "info" : "error",
+          message: shareAttempt.cancelled
+            ? shareAttempt.errorMessage
+            : `${shareAttempt.errorMessage} Используйте быстрые каналы ниже.`,
+        })
+      }
+    }
+  }
+
+  async function handleSmsInviteAction() {
+    if (!inviteMeta || !isInviteAvailable || typeof window === "undefined") {
+      return
+    }
+
+    if (!smsRequiresManualPaste) {
+      window.location.assign(buildSmsHref(inviteMeta.message))
+      return
+    }
+
+    try {
+      await writeTextToClipboard(inviteMeta.message)
+      setInviteActionFeedback({
+        tone: "info",
+        message: "iPhone открывает Messages без текста. Я скопировал приглашение в буфер, останется только вставить его в SMS.",
+      })
+    } catch (error) {
+      setInviteActionFeedback({
+        tone: "error",
+        message: `iPhone не подставляет текст в SMS-ссылку, и скопировать приглашение не удалось: ${humanizeError(error)}`,
+      })
+    }
+
+    window.location.assign("sms:")
+  }
+
+  async function handleNativeShareFromPanel() {
+    if (!inviteMeta || !isInviteAvailable) {
+      return
+    }
+
+    const shareAttempt = await tryNativeShare()
+    if (!shareAttempt.shared) {
+      setInviteActionFeedback({
+        tone: shareAttempt.cancelled ? "info" : "error",
+        message:
+          shareAttempt.errorMessage ??
+          (shareAttempt.cancelled
+            ? "Отправка отменена. Можно выбрать другой способ приглашения ниже."
+            : "Системное меню отправки недоступно. Используйте быстрые каналы ниже."),
+      })
+    }
+  }
+
+  async function handleCopyInviteLink() {
+    if (!inviteMeta || !isInviteAvailable) {
+      return
+    }
+
+    try {
+      await writeTextToClipboard(inviteMeta.shareUrl)
+      clearCopyLinkResetTimer()
+      setCopyLinkLabel("Ссылка скопирована")
+      copyLinkResetTimeoutRef.current = window.setTimeout(() => {
+        setCopyLinkLabel("Скопировать ссылку")
+        copyLinkResetTimeoutRef.current = null
+      }, 1800)
+      setInviteActionFeedback({
+        tone: "success",
+        message: "Ссылка для подключения скопирована.",
+      })
+    } catch (error) {
+      clearCopyLinkResetTimer()
+      setCopyLinkLabel("Не удалось")
+      copyLinkResetTimeoutRef.current = window.setTimeout(() => {
+        setCopyLinkLabel("Скопировать ссылку")
+        copyLinkResetTimeoutRef.current = null
+      }, 1800)
+      setInviteActionFeedback({
+        tone: "error",
+        message: humanizeError(error),
+      })
+    }
+  }
+
+  async function handleCopyInviteText() {
+    if (!inviteMeta || !isInviteAvailable) {
+      return
+    }
+
+    try {
+      await writeTextToClipboard(inviteMeta.message)
+      setInviteActionFeedback({
+        tone: "success",
+        message: "Текст приглашения скопирован.",
+      })
+    } catch (error) {
+      setInviteActionFeedback({
+        tone: "error",
+        message: humanizeError(error),
+      })
+    }
   }
 
   async function handleToggleAudio() {
@@ -1313,6 +1639,8 @@ export function SessionPage() {
       navigator.mediaDevices?.removeEventListener?.("devicechange", handleDeviceChange)
       clearReconnectTimer()
       clearIceRefreshTimer()
+      clearCopyLinkResetTimer()
+      clearInviteFeedbackResetTimer()
       void cleanupSession()
     }
   }, [iceTransportPolicy, joinToken, sessionId])
@@ -1325,10 +1653,207 @@ export function SessionPage() {
     }
   }, [selectedAudioOutputId, supportsAudioOutputSelection])
 
-  const stageMeta = stageCopy[connectionStage]
   const sessionLabel = sessionId ? shortSessionId(sessionId) : "unknown"
+  const smsRequiresManualPaste = isIosDevice()
+  const isInviteAvailable = Boolean(
+    sessionInfo?.canJoin &&
+      sessionInfo?.shareUrl &&
+      sessionInfo.activeParticipants < sessionInfo.maxParticipants &&
+      sessionInfo.status !== "ended" &&
+      sessionInfo.status !== "expired",
+  )
+  const inviteMeta = useMemo(() => {
+    if (!isInviteAvailable || !sessionInfo?.shareUrl) {
+      return null
+    }
+
+    return buildInviteCopy(sessionInfo.shareUrl, sessionLabel)
+  }, [isInviteAvailable, sessionInfo?.shareUrl, sessionLabel])
+  const nativeShareData = inviteMeta
+    ? {
+        title: inviteMeta.title,
+        text: inviteMeta.text,
+        url: inviteMeta.shareUrl,
+      }
+    : null
+  const inviteActions = useMemo(() => {
+    if (!inviteMeta) {
+      return []
+    }
+
+    return [
+      {
+        label: "WhatsApp",
+        description: "Откроем чат с уже собранным текстом приглашения.",
+        href: `https://wa.me/?text=${encodeURIComponent(inviteMeta.message)}`,
+        icon: MessageCircle,
+        external: true,
+        accentClassName: "bg-emerald-400/15 text-emerald-200",
+      },
+      {
+        label: "Telegram",
+        description: "Передадим ссылку и понятный текст в системный шаринг Telegram.",
+        href: `https://t.me/share/url?url=${encodeURIComponent(inviteMeta.shareUrl)}&text=${encodeURIComponent(inviteMeta.text)}`,
+        icon: Send,
+        external: true,
+        accentClassName: "bg-sky-400/15 text-sky-200",
+      },
+      {
+        label: "SMS",
+        description: smsRequiresManualPaste
+          ? "На iPhone откроем Messages и заранее скопируем текст приглашения в буфер."
+          : "Откроем стандартное сообщение с готовым приглашением.",
+        href: smsRequiresManualPaste ? null : buildSmsHref(inviteMeta.message),
+        onClick: smsRequiresManualPaste ? () => void handleSmsInviteAction() : undefined,
+        icon: MessageSquare,
+        external: false,
+        accentClassName: "bg-amber-300/15 text-amber-200",
+      },
+      {
+        label: "E-mail",
+        description: "Подставим тему письма и полный текст приглашения.",
+        href: `mailto:?subject=${encodeURIComponent(inviteMeta.subject)}&body=${encodeURIComponent(inviteMeta.message)}`,
+        icon: Mail,
+        external: false,
+        accentClassName: "bg-violet-300/15 text-violet-200",
+      },
+    ]
+  }, [inviteMeta, smsRequiresManualPaste])
+  const nativeShareAvailable = Boolean(isInviteAvailable && nativeShareData && canUseNativeShare(nativeShareData))
+
+  useEffect(() => {
+    clearInviteFeedbackResetTimer()
+
+    if (!inviteActionFeedback || isInvitePanelVisible) {
+      return
+    }
+
+    inviteFeedbackResetTimeoutRef.current = window.setTimeout(() => {
+      setInviteActionFeedback(null)
+      inviteFeedbackResetTimeoutRef.current = null
+    }, 2200)
+
+    return () => {
+      clearInviteFeedbackResetTimer()
+    }
+  }, [inviteActionFeedback, isInvitePanelVisible])
+
+  useEffect(() => {
+    if (!isInvitePanelVisible) {
+      return
+    }
+
+    const dialog = inviteDialogRef.current
+    if (!dialog) {
+      return
+    }
+
+    previousFocusedElementRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null
+
+    const focusDialog = window.requestAnimationFrame(() => {
+      const focusableElements = getFocusableElements(dialog)
+      ;(focusableElements[0] ?? dialog).focus()
+    })
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault()
+        closeInvitePanel()
+        return
+      }
+
+      if (event.key !== "Tab") {
+        return
+      }
+
+      const focusableElements = getFocusableElements(dialog)
+      if (focusableElements.length === 0) {
+        event.preventDefault()
+        dialog.focus()
+        return
+      }
+
+      const firstFocusable = focusableElements[0]
+      const lastFocusable = focusableElements[focusableElements.length - 1]
+      const activeElement = document.activeElement instanceof HTMLElement ? document.activeElement : null
+
+      if (event.shiftKey) {
+        if (activeElement === firstFocusable || activeElement === dialog) {
+          event.preventDefault()
+          lastFocusable.focus()
+        }
+        return
+      }
+
+      if (activeElement === lastFocusable) {
+        event.preventDefault()
+        firstFocusable.focus()
+      }
+    }
+
+    document.addEventListener("keydown", handleKeyDown)
+    return () => {
+      window.cancelAnimationFrame(focusDialog)
+      document.removeEventListener("keydown", handleKeyDown)
+      previousFocusedElementRef.current?.focus()
+    }
+  }, [isInvitePanelVisible])
+
+  useEffect(() => {
+    if (!inviteMeta) {
+      setInviteActionFeedback(null)
+      setInviteQrCodeUrl(null)
+      setInviteQrCodeError(null)
+      setIsInvitePanelVisible(false)
+      return
+    }
+
+    if (!isInvitePanelVisible) {
+      setInviteQrCodeUrl(null)
+      setInviteQrCodeError(null)
+      return
+    }
+
+    let cancelled = false
+    setInviteQrCodeUrl(null)
+    setInviteQrCodeError(null)
+
+    void import("qrcode")
+      .then(({ toDataURL }) =>
+        toDataURL(inviteMeta.shareUrl, {
+          errorCorrectionLevel: "M",
+          margin: 1,
+          width: 320,
+          color: {
+            dark: "#0f172aff",
+            light: "#ffffffff",
+          },
+        }),
+      )
+      .then((dataUrl) => {
+        if (!cancelled) {
+          setInviteQrCodeUrl(dataUrl)
+        }
+      })
+      .catch((error: unknown) => {
+        console.warn("QR code generation failed", error)
+        if (!cancelled) {
+          setInviteQrCodeError("Не удалось подготовить QR-код. Ниже остается ссылка для ручного открытия.")
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [inviteMeta, isInvitePanelVisible])
+
+  const stageMeta = stageCopy[connectionStage]
   const remoteWaitingTitle =
-    connectionStage === "reconnecting"
+    connectionStage === "ended"
+      ? "Сессия завершена"
+      : connectionStage === "failed"
+        ? "Подключение недоступно"
+        : connectionStage === "reconnecting"
       ? "Восстанавливаем разговор"
       : connectionStage === "connecting"
         ? "Подключаем собеседника"
@@ -1336,9 +1861,11 @@ export function SessionPage() {
   const remoteWaitingDescription =
     connectionStage === "reconnecting"
       ? "Сигналинг временно пропал. Пытаемся заново синхронизировать состояние звонка без перезагрузки страницы."
+      : connectionStage === "ended" || connectionStage === "failed"
+        ? "Эта сессия больше недоступна для новых подключений, поэтому отправка приглашений отключена."
       : connectionStage === "connecting"
         ? "Браузеры уже обмениваются сигналами. Видео появится здесь сразу после установки WebRTC-соединения."
-        : "Как только второй участник откроет ссылку, это окно переключится в полноэкранный режим разговора."
+        : "Отправьте приглашение удобным способом. Как только второй участник откроет ссылку, это окно переключится в полноэкранный режим разговора."
   const isRemoteVideoHidden = remoteConnected && !remoteMediaState.videoEnabled
 
   return (
@@ -1405,17 +1932,43 @@ export function SessionPage() {
               ) : null}
             </div>
 
-            <Button
-              className="gap-2 border border-white/10 bg-black/45 px-4 text-white backdrop-blur-xl hover:bg-black/60"
-              variant="outline"
-              size="sm"
-              onClick={handleCopyLink}
-              disabled={!sessionInfo?.shareUrl}
-            >
-              <Copy className="h-4 w-4" />
-              <span className="hidden sm:inline">{copyLabel}</span>
-              <span className="sm:hidden">Ссылка</span>
-            </Button>
+            <div className="flex items-center gap-2">
+              <Button
+                className="gap-2 bg-orange-500 px-4 text-white shadow-[0_18px_40px_-24px_rgba(249,115,22,0.85)] hover:bg-orange-400"
+                size="sm"
+                onClick={() => void handleShareInvite()}
+                disabled={!inviteMeta}
+              >
+                <Share2 className="h-4 w-4" />
+                <span className="hidden sm:inline">Отправить приглашение</span>
+                <span className="sm:hidden">Пригласить</span>
+              </Button>
+
+              <Button
+                className="gap-2 border border-white/10 bg-black/45 px-4 text-white backdrop-blur-xl hover:bg-black/60"
+                variant="outline"
+                size="sm"
+                onClick={() => void handleCopyInviteLink()}
+                disabled={!inviteMeta}
+                aria-label={copyLinkLabel}
+                title={copyLinkLabel}
+              >
+                <Copy className="h-4 w-4" />
+                <span className="hidden md:inline">{copyLinkLabel}</span>
+              </Button>
+
+              <Button
+                className="h-9 w-9 border border-white/10 bg-black/45 p-0 text-white backdrop-blur-xl hover:bg-black/60"
+                variant="outline"
+                size="sm"
+                onClick={openInvitePanel}
+                disabled={!inviteMeta}
+                aria-label="Показать QR-код и варианты отправки"
+                title="QR-код и варианты отправки"
+              >
+                <QrCode className="h-4 w-4" />
+              </Button>
+            </div>
           </div>
 
           {errorMessage ? (
@@ -1433,6 +1986,31 @@ export function SessionPage() {
               data-testid="session-note"
             >
               {statusNote}
+            </div>
+          ) : null}
+
+          {!isInvitePanelVisible && inviteActionFeedback ? (
+            <div
+              className={cn(
+                "absolute right-3 top-16 z-20 w-[min(92vw,24rem)] rounded-[22px] px-4 py-3 text-sm font-medium leading-6 backdrop-blur-xl sm:right-4 sm:top-20",
+                inviteActionFeedback.tone === "success"
+                  ? "border border-emerald-400/25 bg-emerald-500/15 text-emerald-50"
+                  : inviteActionFeedback.tone === "info"
+                    ? "border border-sky-300/35 bg-sky-500/15 text-sky-50"
+                    : "border border-rose-400/30 bg-rose-500/15 text-rose-50",
+              )}
+              data-testid="invite-feedback-toast"
+            >
+              <div className="flex items-start gap-3">
+                {inviteActionFeedback.tone === "success" ? (
+                  <Check className="mt-0.5 h-4 w-4 shrink-0" />
+                ) : inviteActionFeedback.tone === "info" ? (
+                  <Share2 className="mt-0.5 h-4 w-4 shrink-0" />
+                ) : (
+                  <CircleAlert className="mt-0.5 h-4 w-4 shrink-0" />
+                )}
+                <span>{inviteActionFeedback.message}</span>
+              </div>
             </div>
           ) : null}
 
@@ -1603,6 +2181,203 @@ export function SessionPage() {
                 </p>
               </CardContent>
             </Card>
+          ) : null}
+
+          {isInvitePanelVisible && inviteMeta ? (
+            <div className="fixed inset-0 z-40 flex items-start justify-center bg-slate-950/78 p-4 pt-20 backdrop-blur-sm sm:pt-24">
+              <div
+                className="absolute inset-0"
+                onClick={closeInvitePanel}
+                aria-hidden="true"
+              />
+
+              <div
+                ref={inviteDialogRef}
+                className="relative z-10 w-full max-w-5xl"
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="invite-dialog-title"
+                aria-describedby="invite-dialog-description"
+                tabIndex={-1}
+              >
+                <Card className="max-h-[calc(100vh-6rem)] overflow-auto rounded-[30px] border border-white/10 bg-slate-950/92 text-white shadow-[0_40px_120px_rgba(2,6,23,0.7)]">
+                  <CardContent className="grid gap-5 p-4 pt-4 sm:p-5 sm:pt-5 lg:grid-cols-[minmax(0,1.08fr)_minmax(280px,0.92fr)]">
+                  <div className="space-y-5">
+                    <div className="flex items-start justify-between gap-4">
+                      <div className="space-y-1">
+                        <p className="text-sm font-semibold text-white" id="invite-dialog-title">
+                          Отправить приглашение
+                        </p>
+                        <p className="max-w-xl text-xs leading-5 text-slate-300" id="invite-dialog-description">
+                          Выберите быстрый канал или скопируйте готовый текст. Получатель увидит нормальное приглашение,
+                          а не голую ссылку.
+                        </p>
+                      </div>
+                      <Button
+                        className="h-8 w-8 border border-white/10 bg-black/35 p-0 text-white hover:bg-black/55"
+                        variant="outline"
+                        size="sm"
+                        onClick={closeInvitePanel}
+                        aria-label="Закрыть панель приглашения"
+                        title="Закрыть панель приглашения"
+                      >
+                        <X className="h-4 w-4" />
+                      </Button>
+                    </div>
+
+                    <div className="rounded-[28px] border border-sky-400/15 bg-sky-400/10 p-4">
+                      <p className="text-xs font-semibold uppercase tracking-[0.24em] text-sky-200">Текст приглашения</p>
+                      <p className="mt-3 text-sm leading-6 text-slate-100">{inviteMeta.text}</p>
+                      <p className="mt-3 rounded-[20px] border border-white/10 bg-black/25 px-4 py-3 text-xs leading-6 text-slate-300">
+                        {inviteMeta.shareUrl}
+                      </p>
+                    </div>
+
+                    {inviteActionFeedback ? (
+                      <div
+                        className={cn(
+                          "flex items-start gap-3 rounded-[24px] px-4 py-3 text-sm font-medium leading-6",
+                          inviteActionFeedback.tone === "success"
+                            ? "border border-emerald-400/20 bg-emerald-500/10 text-emerald-100"
+                            : inviteActionFeedback.tone === "info"
+                              ? "border border-sky-300/35 bg-sky-500/10 text-sky-100"
+                              : "border border-rose-400/25 bg-rose-500/10 text-rose-100",
+                        )}
+                      >
+                        {inviteActionFeedback.tone === "success" ? (
+                          <Check className="mt-0.5 h-4 w-4 shrink-0" />
+                        ) : inviteActionFeedback.tone === "info" ? (
+                          <Share2 className="mt-0.5 h-4 w-4 shrink-0" />
+                        ) : (
+                          <CircleAlert className="mt-0.5 h-4 w-4 shrink-0" />
+                        )}
+                        <span>{inviteActionFeedback.message}</span>
+                      </div>
+                    ) : (
+                      <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
+                        Можно отправить системным шарингом, через мессенджер, по SMS или показать QR-код на втором устройстве.
+                      </div>
+                    )}
+
+                    {nativeShareAvailable ? (
+                      <Button className="w-full gap-2" onClick={() => void handleNativeShareFromPanel()}>
+                        <Share2 className="h-4 w-4" />
+                        Открыть системное меню отправки
+                      </Button>
+                    ) : null}
+
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      {inviteActions.map((action) => (
+                        action.href ? (
+                          <a
+                            key={action.label}
+                            className="group rounded-[26px] border border-white/10 bg-white/6 p-4 transition hover:border-white/20 hover:bg-white/10"
+                            href={action.href}
+                            target={action.external ? "_blank" : undefined}
+                            rel={action.external ? "noreferrer" : undefined}
+                          >
+                            <div className="flex items-start gap-3">
+                              <div
+                                className={cn(
+                                  "flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl border border-white/10",
+                                  action.accentClassName,
+                                )}
+                              >
+                                <action.icon className="h-5 w-5" />
+                              </div>
+                              <div className="min-w-0 flex-1">
+                                <div className="flex items-center justify-between gap-2">
+                                  <p className="text-sm font-semibold text-white">{action.label}</p>
+                                  {action.external ? (
+                                    <ExternalLink className="h-4 w-4 shrink-0 text-slate-500 transition group-hover:text-slate-300" />
+                                  ) : null}
+                                </div>
+                                <p className="mt-1 text-xs leading-5 text-slate-300">{action.description}</p>
+                              </div>
+                            </div>
+                          </a>
+                        ) : (
+                          <button
+                            key={action.label}
+                            className="group rounded-[26px] border border-white/10 bg-white/6 p-4 text-left transition hover:border-white/20 hover:bg-white/10"
+                            type="button"
+                            onClick={action.onClick}
+                          >
+                            <div className="flex items-start gap-3">
+                              <div
+                                className={cn(
+                                  "flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl border border-white/10",
+                                  action.accentClassName,
+                                )}
+                              >
+                                <action.icon className="h-5 w-5" />
+                              </div>
+                              <div className="min-w-0 flex-1">
+                                <p className="text-sm font-semibold text-white">{action.label}</p>
+                                <p className="mt-1 text-xs leading-5 text-slate-300">{action.description}</p>
+                              </div>
+                            </div>
+                          </button>
+                        )
+                      ))}
+                    </div>
+
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <Button className="gap-2" variant="outline" onClick={() => void handleCopyInviteText()}>
+                        <Copy className="h-4 w-4" />
+                        Скопировать текст
+                      </Button>
+                      <Button className="gap-2" variant="outline" onClick={() => void handleCopyInviteLink()}>
+                        <Link2 className="h-4 w-4" />
+                        Скопировать ссылку
+                      </Button>
+                    </div>
+                  </div>
+
+                    <div className="space-y-4">
+                      <div className="rounded-[30px] border border-white/10 bg-white/95 p-4 text-slate-950 shadow-[0_24px_70px_-42px_rgba(15,23,42,0.55)]">
+                      <div className="flex items-start justify-between gap-4">
+                        <div>
+                          <p className="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">QR для второго устройства</p>
+                          <p className="mt-2 text-sm leading-6 text-slate-600">
+                            Покажите этот экран рядом со вторым телефоном или планшетом, чтобы подключиться без ручного ввода ссылки.
+                          </p>
+                        </div>
+                        <span className="rounded-full bg-slate-100 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.2em] text-slate-500">
+                          Session {sessionLabel}
+                        </span>
+                      </div>
+
+                      <div className="mt-4 rounded-[28px] border border-slate-200 bg-white p-4 shadow-sm">
+                        {inviteQrCodeUrl ? (
+                          <img
+                            src={inviteQrCodeUrl}
+                            alt="QR-код приглашения на видеозвонок"
+                            className="mx-auto aspect-square w-full max-w-[260px] rounded-[20px]"
+                          />
+                        ) : inviteQrCodeError ? (
+                          <div className="flex min-h-[260px] items-center justify-center rounded-[20px] bg-slate-100 px-6 text-center text-sm leading-6 text-slate-600">
+                            {inviteQrCodeError}
+                          </div>
+                        ) : (
+                          <div className="flex min-h-[260px] items-center justify-center rounded-[20px] bg-slate-100">
+                            <LoaderCircle className="h-8 w-8 animate-spin text-slate-400" />
+                          </div>
+                        )}
+                      </div>
+
+                      <p className="mt-4 text-xs leading-5 text-slate-500">
+                        Если QR неудобен, ниже остается та же ссылка для ручного открытия в браузере.
+                      </p>
+                      <p className="mt-3 break-all rounded-[20px] bg-slate-100 px-4 py-3 text-xs leading-6 text-slate-700">
+                        {inviteMeta.shareUrl}
+                      </p>
+                      </div>
+                    </div>
+                  </CardContent>
+                </Card>
+              </div>
+            </div>
           ) : null}
 
           <div className="absolute inset-x-0 bottom-0 z-20 flex justify-center p-3 sm:p-4 md:p-5">

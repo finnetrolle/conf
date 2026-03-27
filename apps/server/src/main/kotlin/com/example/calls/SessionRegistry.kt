@@ -180,6 +180,7 @@ class SessionRegistry(
                                 payload = buildJsonObject {
                                     put("participantId", participant.participantId)
                                     put("role", role.name.lowercase())
+                                    put("activeParticipants", session.activeParticipantCount())
                                 },
                             ),
                         ),
@@ -278,6 +279,7 @@ class SessionRegistry(
                                 payload = buildJsonObject {
                                     put("participantId", participant.participantId)
                                     put("role", participant.role.name.lowercase())
+                                    put("activeParticipants", session.activeParticipantCount())
                                 },
                             ),
                         ),
@@ -403,6 +405,7 @@ class SessionRegistry(
                                 payload = buildJsonObject {
                                     put("participantId", participant.participantId)
                                     put("role", participant.role.name.lowercase())
+                                    put("activeParticipants", session.activeParticipantCount())
                                 },
                             ),
                         ),
