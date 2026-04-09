@@ -81,6 +81,31 @@ type InviteActionFeedback = {
   message: string
 }
 
+type EchoCancellationConstraint = Exclude<MediaTrackConstraints["echoCancellation"], undefined>
+type ExtendedEchoCancellationConstraint = EchoCancellationConstraint | "all" | "remote-only"
+type ExtendedMediaTrackConstraints = MediaTrackConstraints & {
+  echoCancellation?: ExtendedEchoCancellationConstraint
+}
+
+type MediaTrackCapabilitiesWithExtendedEchoCancellation = MediaTrackCapabilities & {
+  echoCancellation?: Array<boolean | string> | boolean
+}
+
+type MediaTrackSettingsWithExtendedAudioProcessing = MediaTrackSettings & {
+  echoCancellation?: boolean | string
+  noiseSuppression?: boolean
+  autoGainControl?: boolean
+}
+
+type AudioProcessingDiagnostics = {
+  badgeLabel: string
+  tone: "emerald" | "amber" | "slate"
+  modeLabel: string
+  echoCancellationLabel: string
+  noiseSuppressionLabel: string
+  autoGainControlLabel: string
+}
+
 const defaultMediaState: MediaState = { audioEnabled: true, videoEnabled: true }
 
 const stageCopy: Record<ConnectionStage, { label: string; badge: "amber" | "blue" | "green" | "rose" | "slate" }> = {
@@ -120,18 +145,22 @@ function extractTurnCredentialExpiry(iceServers: IceServerConfig[]) {
   return Math.min(...expirationCandidates) * 1_000
 }
 
-function isConstraintError(error: unknown) {
-  if (!(error instanceof Error)) {
+function isRecoverableGetUserMediaError(error: unknown) {
+  if (typeof error !== "object" || error === null) {
     return false
   }
 
-  const message = error.message.toLowerCase()
-  const name = "name" in error ? String((error as { name?: unknown }).name) : ""
+  const name = "name" in error ? String((error as { name?: unknown }).name ?? "") : ""
+  const message = "message" in error ? String((error as { message?: unknown }).message ?? "").toLowerCase() : ""
 
   return (
     name === "OverconstrainedError" ||
+    name === "NotFoundError" ||
+    name === "DevicesNotFoundError" ||
     message.includes("invalid constraint") ||
-    message.includes("overconstrained")
+    message.includes("overconstrained") ||
+    message.includes("requested device not found") ||
+    message.includes("device not found")
   )
 }
 
@@ -159,6 +188,7 @@ function buildMediaConstraints(options: {
   height?: number
   audio?: boolean
   video?: boolean
+  echoCancellationEnabled?: boolean
 }): MediaStreamConstraints {
   const {
     videoDeviceId,
@@ -168,6 +198,7 @@ function buildMediaConstraints(options: {
     height,
     audio = true,
     video = true,
+    echoCancellationEnabled = false,
   } = options
 
   let videoConstraints: MediaTrackConstraints | boolean = false
@@ -191,18 +222,25 @@ function buildMediaConstraints(options: {
 
   let audioConstraints: MediaTrackConstraints | boolean = false
   if (audio) {
-    if (mode === "default" || !audioDeviceId) {
-      audioConstraints = true
-    } else {
-      audioConstraints = {
-        deviceId: mode === "exact" ? { exact: audioDeviceId } : { ideal: audioDeviceId },
-      }
-    }
+    const nextAudioConstraints = buildAudioConstraints({
+      audioDeviceId,
+      mode,
+      enhancedAudioProcessingEnabled: echoCancellationEnabled,
+    })
+
+    audioConstraints = Object.keys(nextAudioConstraints).length > 0 ? nextAudioConstraints : true
   }
 
   return {
     video: videoConstraints,
     audio: audioConstraints,
+  }
+}
+
+function deriveLocalMediaState(stream: MediaStream, previousState: MediaState): MediaState {
+  return {
+    audioEnabled: stream.getAudioTracks().length > 0 ? previousState.audioEnabled : false,
+    videoEnabled: stream.getVideoTracks().length > 0 ? previousState.videoEnabled : false,
   }
 }
 
@@ -226,6 +264,178 @@ function fallbackDevicesFromStream(stream: MediaStream | null): DeviceLists {
     videoInputs,
     audioOutputs: [],
   }
+}
+
+function getSupportedAudioProcessingConstraints() {
+  if (typeof navigator === "undefined" || typeof navigator.mediaDevices?.getSupportedConstraints !== "function") {
+    return {
+      echoCancellation: false,
+      noiseSuppression: false,
+      autoGainControl: false,
+    }
+  }
+
+  const supportedConstraints = navigator.mediaDevices.getSupportedConstraints()
+
+  return {
+    echoCancellation: Boolean(supportedConstraints.echoCancellation),
+    noiseSuppression: Boolean(supportedConstraints.noiseSuppression),
+    autoGainControl: Boolean(supportedConstraints.autoGainControl),
+  }
+}
+
+function getPreferredEchoCancellationConstraint(
+  audioTrack?: MediaStreamTrack | null,
+): ExtendedMediaTrackConstraints["echoCancellation"] {
+  const capabilities = audioTrack?.getCapabilities?.() as MediaTrackCapabilitiesWithExtendedEchoCancellation | undefined
+  const echoCancellation = capabilities?.echoCancellation as unknown
+
+  if (Array.isArray(echoCancellation)) {
+    if (echoCancellation.some((value) => value === "all")) {
+      return "all"
+    }
+
+    if (echoCancellation.some((value) => value === "remote-only")) {
+      return "remote-only"
+    }
+
+    if (echoCancellation.some((value) => value === true)) {
+      return true
+    }
+
+    return undefined
+  }
+
+  if (echoCancellation === true) {
+    return true
+  }
+
+  if (echoCancellation === false) {
+    return undefined
+  }
+
+  return true
+}
+
+function buildAudioConstraints(options: {
+  audioDeviceId?: string
+  mode?: "exact" | "ideal" | "default"
+  enhancedAudioProcessingEnabled?: boolean
+  audioTrack?: MediaStreamTrack | null
+}) {
+  const {
+    audioDeviceId,
+    mode = "default",
+    enhancedAudioProcessingEnabled = false,
+    audioTrack,
+  } = options
+  const nextAudioConstraints: ExtendedMediaTrackConstraints = {}
+  const supportedAudioProcessingConstraints = getSupportedAudioProcessingConstraints()
+
+  if (enhancedAudioProcessingEnabled) {
+    if (supportedAudioProcessingConstraints.echoCancellation) {
+      const preferredEchoCancellationConstraint = getPreferredEchoCancellationConstraint(audioTrack)
+      if (preferredEchoCancellationConstraint !== undefined) {
+        nextAudioConstraints.echoCancellation = preferredEchoCancellationConstraint
+      }
+    }
+
+    if (supportedAudioProcessingConstraints.noiseSuppression) {
+      nextAudioConstraints.noiseSuppression = true
+    }
+
+    if (supportedAudioProcessingConstraints.autoGainControl) {
+      nextAudioConstraints.autoGainControl = true
+    }
+  }
+
+  if (mode !== "default" && audioDeviceId) {
+    nextAudioConstraints.deviceId = mode === "exact" ? { exact: audioDeviceId } : { ideal: audioDeviceId }
+  }
+
+  return nextAudioConstraints
+}
+
+function formatBooleanDiagnostic(value: boolean | undefined) {
+  if (value === true) {
+    return "вкл"
+  }
+
+  if (value === false) {
+    return "выкл"
+  }
+
+  return "н/д"
+}
+
+function buildDefaultAudioProcessingDiagnostics(): AudioProcessingDiagnostics {
+  return {
+    badgeLabel: "Микрофон: нет данных",
+    tone: "slate",
+    modeLabel: "Диагностика недоступна",
+    echoCancellationLabel: "н/д",
+    noiseSuppressionLabel: "н/д",
+    autoGainControlLabel: "н/д",
+  }
+}
+
+function buildAudioProcessingDiagnostics(
+  audioTrack: MediaStreamTrack | null,
+  enhancedAudioProcessingEnabled: boolean,
+): AudioProcessingDiagnostics {
+  if (!audioTrack) {
+    return buildDefaultAudioProcessingDiagnostics()
+  }
+
+  const settings = audioTrack.getSettings() as MediaTrackSettingsWithExtendedAudioProcessing
+  const constraints = audioTrack.getConstraints() as ExtendedMediaTrackConstraints
+  const appliedEchoCancellation = settings.echoCancellation
+  const requestedEchoCancellation = constraints.echoCancellation
+  const echoMode =
+    requestedEchoCancellation === "all"
+      ? "all"
+      : requestedEchoCancellation === "remote-only"
+        ? "remote-only"
+        : appliedEchoCancellation === true
+          ? enhancedAudioProcessingEnabled
+            ? "вкл (усиленный)"
+            : "вкл (браузер)"
+          : appliedEchoCancellation === false
+            ? "выкл"
+            : "н/д"
+  const noiseSuppressionLabel = formatBooleanDiagnostic(settings.noiseSuppression)
+  const autoGainControlLabel = formatBooleanDiagnostic(settings.autoGainControl)
+  const tone: AudioProcessingDiagnostics["tone"] =
+    appliedEchoCancellation === true || requestedEchoCancellation === "all" || requestedEchoCancellation === "remote-only"
+      ? "emerald"
+      : enhancedAudioProcessingEnabled
+        ? "amber"
+        : "slate"
+
+  return {
+    badgeLabel: `AEC ${echoMode} · NS ${noiseSuppressionLabel} · AGC ${autoGainControlLabel}`,
+    tone,
+    modeLabel: enhancedAudioProcessingEnabled ? "Усиленный режим микрофона" : "Обычная обработка браузера",
+    echoCancellationLabel: echoMode,
+    noiseSuppressionLabel,
+    autoGainControlLabel,
+  }
+}
+
+function hasAppliedEnhancedAudioProcessing(audioTrack: MediaStreamTrack | null) {
+  if (!audioTrack) {
+    return false
+  }
+
+  const settings = audioTrack.getSettings() as MediaTrackSettingsWithExtendedAudioProcessing
+  const constraints = audioTrack.getConstraints() as ExtendedMediaTrackConstraints
+  const echoCancellationRequested = constraints.echoCancellation !== undefined
+  const echoCancellationApplied =
+    echoCancellationRequested && (settings.echoCancellation === true || typeof settings.echoCancellation === "string")
+  const noiseSuppressionApplied = constraints.noiseSuppression === true && settings.noiseSuppression === true
+  const autoGainControlApplied = constraints.autoGainControl === true && settings.autoGainControl === true
+
+  return echoCancellationApplied || noiseSuppressionApplied || autoGainControlApplied
 }
 
 const focusableDialogSelector = [
@@ -338,11 +548,16 @@ export function SessionPage() {
   const [selectedVideoDeviceId, setSelectedVideoDeviceId] = useState("")
   const [selectedAudioDeviceId, setSelectedAudioDeviceId] = useState("")
   const [selectedAudioOutputId, setSelectedAudioOutputId] = useState("")
+  const [isEchoCancellationEnabled, setIsEchoCancellationEnabled] = useState(false)
+  const [audioProcessingDiagnostics, setAudioProcessingDiagnostics] = useState<AudioProcessingDiagnostics>(
+    buildDefaultAudioProcessingDiagnostics,
+  )
   const [localMediaState, setLocalMediaState] = useState<MediaState>(defaultMediaState)
   const [remoteMediaState, setRemoteMediaState] = useState<MediaState>(defaultMediaState)
   const [role, setRole] = useState<ParticipantRole | null>(null)
   const [remoteConnected, setRemoteConnected] = useState(false)
   const [supportsAudioOutputSelection, setSupportsAudioOutputSelection] = useState(false)
+  const [supportsEchoCancellation, setSupportsEchoCancellation] = useState(false)
   const [isLocalPreviewVisible, setIsLocalPreviewVisible] = useState(true)
   const [isSettingsVisible, setIsSettingsVisible] = useState(false)
   const [mediaAccessIssue, setMediaAccessIssue] = useState<string | null>(null)
@@ -360,6 +575,7 @@ export function SessionPage() {
   const selectedVideoDeviceIdRef = useRef("")
   const selectedAudioDeviceIdRef = useRef("")
   const selectedAudioOutputIdRef = useRef("")
+  const isEchoCancellationEnabledRef = useRef(false)
   const sessionInfoRef = useRef<SessionInfoResponse | null>(null)
   const iceServersRef = useRef<RTCIceServer[]>([])
   const leavingRef = useRef(false)
@@ -721,6 +937,53 @@ export function SessionPage() {
     await videoElement.setSinkId(deviceId)
   }
 
+  function updateEchoCancellationPreference(nextState: boolean) {
+    isEchoCancellationEnabledRef.current = nextState
+    setIsEchoCancellationEnabled(nextState)
+  }
+
+  function refreshAudioProcessingDiagnostics(
+    audioTrack: MediaStreamTrack | null = localStreamRef.current?.getAudioTracks()[0] ?? null,
+    enhancedAudioProcessingEnabled = isEchoCancellationEnabledRef.current,
+  ) {
+    setAudioProcessingDiagnostics(buildAudioProcessingDiagnostics(audioTrack, enhancedAudioProcessingEnabled))
+  }
+
+  async function applyEnhancedAudioProcessing(audioTrack: MediaStreamTrack) {
+    const strongestConstraints = buildAudioConstraints({
+      enhancedAudioProcessingEnabled: true,
+      audioTrack,
+    })
+
+    if (Object.keys(strongestConstraints).length === 0) {
+      return false
+    }
+
+    try {
+      await audioTrack.applyConstraints(strongestConstraints)
+    } catch (error) {
+      const fallbackConstraints = buildAudioConstraints({
+        enhancedAudioProcessingEnabled: true,
+      })
+
+      const strongestEchoCancellation = strongestConstraints.echoCancellation
+      const fallbackEchoCancellation = fallbackConstraints.echoCancellation
+      const canRetryWithFallback =
+        strongestEchoCancellation !== undefined &&
+        fallbackEchoCancellation !== undefined &&
+        strongestEchoCancellation !== fallbackEchoCancellation
+
+      if (!canRetryWithFallback) {
+        throw error
+      }
+
+      console.warn("Enhanced echo cancellation mode was rejected, retrying with a compatible profile", error)
+      await audioTrack.applyConstraints(fallbackConstraints)
+    }
+
+    return hasAppliedEnhancedAudioProcessing(audioTrack)
+  }
+
   async function replaceTracks(previousStream: MediaStream | null, nextStream: MediaStream) {
     const peerConnection = peerConnectionRef.current
     if (!peerConnection) {
@@ -749,7 +1012,11 @@ export function SessionPage() {
     previousStream?.getTracks().forEach((track) => track.stop())
   }
 
-  async function initializeLocalMedia(nextVideoDeviceId?: string, nextAudioDeviceId?: string) {
+  async function initializeLocalMedia(
+    nextVideoDeviceId?: string,
+    nextAudioDeviceId?: string,
+    echoCancellationEnabled = isEchoCancellationEnabledRef.current,
+  ) {
     const mediaEnvironmentIssue = getMediaEnvironmentIssue()
     if (mediaEnvironmentIssue) {
       throw new Error(mediaEnvironmentIssue)
@@ -769,6 +1036,7 @@ export function SessionPage() {
           mode: "exact",
           width: 1280,
           height: 720,
+          echoCancellationEnabled,
         }),
       },
       {
@@ -779,6 +1047,7 @@ export function SessionPage() {
           mode: "ideal",
           width: 1280,
           height: 720,
+          echoCancellationEnabled,
         }),
       },
       {
@@ -787,6 +1056,7 @@ export function SessionPage() {
           width: 1280,
           height: 720,
           mode: "default",
+          echoCancellationEnabled,
         }),
       },
       {
@@ -795,6 +1065,7 @@ export function SessionPage() {
           width: 640,
           height: 480,
           mode: "default",
+          echoCancellationEnabled,
         }),
       },
       {
@@ -805,6 +1076,7 @@ export function SessionPage() {
           mode: "default",
           audio: false,
           video: true,
+          echoCancellationEnabled,
         }),
       },
       {
@@ -815,6 +1087,7 @@ export function SessionPage() {
           mode: "default",
           audio: false,
           video: true,
+          echoCancellationEnabled,
         }),
       },
       {
@@ -823,6 +1096,7 @@ export function SessionPage() {
           mode: "default",
           audio: true,
           video: false,
+          echoCancellationEnabled,
         }),
       },
     ]
@@ -837,7 +1111,7 @@ export function SessionPage() {
       } catch (error) {
         console.error(`getUserMedia failed on attempt ${attempt.label}`, error, attempt.constraints)
         lastError = error
-        if (!isConstraintError(error)) {
+        if (!isRecoverableGetUserMediaError(error)) {
           throw error
         }
       }
@@ -847,21 +1121,35 @@ export function SessionPage() {
       throw lastError instanceof Error ? lastError : new Error("Не удалось получить доступ к камере и микрофону.")
     }
 
+    let enhancedAudioProcessingApplied = !echoCancellationEnabled
+    if (echoCancellationEnabled) {
+      for (const track of nextStream.getAudioTracks()) {
+        enhancedAudioProcessingApplied = (await applyEnhancedAudioProcessing(track)) || enhancedAudioProcessingApplied
+      }
+    }
+
+    const nextLocalMediaState = deriveLocalMediaState(nextStream, localMediaStateRef.current)
+
     nextStream.getAudioTracks().forEach((track) => {
-      track.enabled = localMediaStateRef.current.audioEnabled
+      track.enabled = nextLocalMediaState.audioEnabled
       selectedAudioDeviceIdRef.current = track.getSettings().deviceId ?? nextAudioDeviceId ?? selectedAudioDeviceIdRef.current
     })
     nextStream.getVideoTracks().forEach((track) => {
-      track.enabled = localMediaStateRef.current.videoEnabled
+      track.enabled = nextLocalMediaState.videoEnabled
       selectedVideoDeviceIdRef.current = track.getSettings().deviceId ?? nextVideoDeviceId ?? selectedVideoDeviceIdRef.current
     })
 
+    localMediaStateRef.current = nextLocalMediaState
+    setLocalMediaState(nextLocalMediaState)
     localStreamRef.current = nextStream
+    refreshAudioProcessingDiagnostics(nextStream.getAudioTracks()[0] ?? null, echoCancellationEnabled)
     attachLocalStream(nextStream)
     await replaceTracks(previousStream, nextStream)
     await refreshDevices(nextStream)
     setSelectedAudioDeviceId(selectedAudioDeviceIdRef.current)
     setSelectedVideoDeviceId(selectedVideoDeviceIdRef.current)
+    broadcastLocalMediaState(nextLocalMediaState)
+    return enhancedAudioProcessingApplied
   }
 
   function sendSocketMessage(type: string, payload: Record<string, unknown> | MediaState = {}) {
@@ -1098,6 +1386,8 @@ export function SessionPage() {
           patchSessionInfo({ activeParticipants })
         }
 
+        broadcastLocalMediaState(localMediaStateRef.current)
+
         if (resumed && peerPresent && canReusePeerConnection) {
           setRemoteConnected(
             remoteStreamRef.current.getTracks().length > 0 || peerConnectionRef.current?.connectionState === "connected",
@@ -1144,6 +1434,7 @@ export function SessionPage() {
         }
         setStatusNote(null)
         setConnectionStage("connecting")
+        broadcastLocalMediaState(localMediaStateRef.current)
         if (roleRef.current === "host") {
           await resetPeerConnection(true)
           await createOffer()
@@ -1529,6 +1820,51 @@ export function SessionPage() {
     }
   }
 
+  async function handleToggleEchoCancellation() {
+    const nextState = !isEchoCancellationEnabledRef.current
+
+    try {
+      setErrorMessage(null)
+      const audioTrack = localStreamRef.current?.getAudioTracks()[0]
+      let enhancedAudioProcessingApplied = !nextState
+      if (audioTrack && nextState) {
+        try {
+          enhancedAudioProcessingApplied = await applyEnhancedAudioProcessing(audioTrack)
+          refreshAudioProcessingDiagnostics(audioTrack, nextState)
+          if (!enhancedAudioProcessingApplied) {
+            enhancedAudioProcessingApplied = await initializeLocalMedia(
+              selectedVideoDeviceIdRef.current,
+              selectedAudioDeviceIdRef.current,
+              nextState,
+            )
+          }
+        } catch (error) {
+          console.warn("Unable to update echo cancellation via applyConstraints, reinitializing local media", error)
+          enhancedAudioProcessingApplied = await initializeLocalMedia(
+            selectedVideoDeviceIdRef.current,
+            selectedAudioDeviceIdRef.current,
+            nextState,
+          )
+        }
+      } else {
+        enhancedAudioProcessingApplied = await initializeLocalMedia(
+          selectedVideoDeviceIdRef.current,
+          selectedAudioDeviceIdRef.current,
+          nextState,
+        )
+      }
+
+      if (nextState && !enhancedAudioProcessingApplied) {
+        await initializeLocalMedia(selectedVideoDeviceIdRef.current, selectedAudioDeviceIdRef.current, false)
+        throw new Error("Для текущего микрофона усиленное эхоподавление недоступно.")
+      }
+
+      updateEchoCancellationPreference(nextState)
+    } catch (error) {
+      setErrorMessage(humanizeError(error))
+    }
+  }
+
   async function cleanupSession() {
     leavingRef.current = true
     reconnectEnabledRef.current = false
@@ -1540,6 +1876,7 @@ export function SessionPage() {
     await resetPeerConnection(true)
     localStreamRef.current?.getTracks().forEach((track) => track.stop())
     localStreamRef.current = null
+    setAudioProcessingDiagnostics(buildDefaultAudioProcessingDiagnostics())
     attachLocalStream(null)
     setConnectionPath("unknown")
     clearIceRefreshTimer()
@@ -1553,6 +1890,7 @@ export function SessionPage() {
 
   useEffect(() => {
     setSupportsAudioOutputSelection(typeof (HTMLMediaElement.prototype as HTMLMediaElement & { setSinkId?: unknown }).setSinkId === "function")
+    setSupportsEchoCancellation(Boolean(navigator.mediaDevices?.getSupportedConstraints?.().echoCancellation))
   }, [])
 
   useEffect(() => {
@@ -1603,6 +1941,7 @@ export function SessionPage() {
           setLocalMediaState(disabledMediaState)
           setMediaAccessIssue(mediaEnvironmentIssue)
           setErrorMessage(mediaEnvironmentIssue)
+          setAudioProcessingDiagnostics(buildDefaultAudioProcessingDiagnostics())
           attachLocalStream(null)
           await refreshDevices(null)
         } else {
@@ -1874,6 +2213,12 @@ export function SessionPage() {
       : connectionStage === "connecting"
         ? "Подключаем звук и видео. Обычно это занимает всего несколько секунд."
         : "Отправьте приглашение удобным способом. Как только второй человек откроет ссылку, разговор начнется автоматически."
+  const hasLocalAudioTrack = Boolean(localStreamRef.current?.getAudioTracks()[0])
+  const hasLocalVideoTrack = Boolean(localStreamRef.current?.getVideoTracks()[0])
+  const mediaFallbackNote =
+    !mediaAccessIssue && hasLocalAudioTrack && !hasLocalVideoTrack
+      ? "Камера не найдена. Продолжаем звонок только голосом."
+      : null
   const isRemoteVideoHidden = remoteConnected && !remoteMediaState.videoEnabled
 
   return (
@@ -1940,6 +2285,22 @@ export function SessionPage() {
                   {connectionPathCopy[connectionPath]}
                 </span>
               ) : null}
+              {supportMode ? (
+                <span
+                  className={cn(
+                    "rounded-full px-3 py-1 text-xs font-medium backdrop-blur-xl",
+                    audioProcessingDiagnostics.tone === "emerald"
+                      ? "border border-emerald-300/20 bg-emerald-500/15 text-emerald-50"
+                      : audioProcessingDiagnostics.tone === "amber"
+                        ? "border border-amber-300/20 bg-amber-500/15 text-amber-50"
+                        : "border border-white/10 bg-black/45 text-slate-100",
+                  )}
+                  data-testid="audio-processing-badge"
+                  title={`Обработка микрофона: ${audioProcessingDiagnostics.badgeLabel}`}
+                >
+                  {audioProcessingDiagnostics.badgeLabel}
+                </span>
+              ) : null}
             </div>
 
             <div className="flex items-center gap-2">
@@ -1990,12 +2351,12 @@ export function SessionPage() {
             </div>
           ) : null}
 
-          {!errorMessage && statusNote ? (
+          {!errorMessage && (statusNote ?? mediaFallbackNote) ? (
             <div
               className="absolute left-1/2 top-20 z-20 w-[min(92%,54rem)] -translate-x-1/2 rounded-[22px] border border-sky-300/35 bg-sky-500/15 px-4 py-3 text-sm font-medium leading-6 text-sky-50 backdrop-blur-xl sm:top-24"
               data-testid="session-note"
             >
-              {statusNote}
+              {statusNote ?? mediaFallbackNote}
             </div>
           ) : null}
 
@@ -2057,7 +2418,7 @@ export function SessionPage() {
               />
               {!localMediaState.videoEnabled ? (
                 <div className="absolute inset-0 flex items-center justify-center bg-slate-950/75 px-4 text-center text-xs font-semibold text-white sm:text-sm">
-                  Камера выключена
+                  {hasLocalVideoTrack ? "Камера выключена" : "Камера недоступна, продолжаем только голосом"}
                 </div>
               ) : null}
 
@@ -2190,6 +2551,38 @@ export function SessionPage() {
                     : "Если переключение здесь не сработает, звук останется на устройстве, выбранном в системе."}
                 </p>
 
+                <div className="rounded-[24px] border border-white/10 bg-white/5 p-4">
+                  <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+                    <div className="space-y-1">
+                      <p className="text-sm font-semibold text-white">Глушение эха</p>
+                      <p className="text-xs leading-5 text-slate-300">
+                        Если голос собеседника попадает из динамика обратно в ваш микрофон, включите программную
+                        обработку звука для микрофона. Усиленный режим просит у браузера эхоподавление, шумоподавление
+                        и автоконтроль уровня, а где возможно включает более сильный профиль AEC.
+                      </p>
+                    </div>
+                    <Button
+                      className={cn(
+                        "min-w-[11rem]",
+                        isEchoCancellationEnabled
+                          ? "bg-emerald-500 text-white hover:bg-emerald-400"
+                          : "border border-white/10 bg-black/35 text-white hover:bg-black/55",
+                      )}
+                      variant={isEchoCancellationEnabled ? "default" : "outline"}
+                      onClick={() => void handleToggleEchoCancellation()}
+                      disabled={Boolean(mediaAccessIssue) || !supportsEchoCancellation}
+                      data-testid="echo-cancellation-toggle"
+                    >
+                      {isEchoCancellationEnabled ? "Включено" : "Выключено"}
+                    </Button>
+                  </div>
+                  <p className="mt-3 text-xs leading-5 text-slate-300">
+                    {supportsEchoCancellation
+                      ? "Когда режим выключен, звонок остаётся на обычной обработке браузера. Когда включен, мы просим максимально доступную обработку микрофона, но эффект всё равно зависит от устройства."
+                      : "В этом браузере или на этом устройстве переключаемое эхоподавление недоступно."}
+                  </p>
+                </div>
+
                 {supportMode ? (
                   <div className="rounded-[24px] border border-amber-300/20 bg-amber-400/10 p-4">
                     <p className="text-xs font-semibold uppercase tracking-[0.22em] text-amber-200">Режим помощи</p>
@@ -2197,6 +2590,12 @@ export function SessionPage() {
                       <p>Код звонка: {sessionLabel}</p>
                       <p>Как вы вошли: {role ? roleCopy[role] : "Определяем"}</p>
                       <p>Путь связи: {connectionPathCopy[connectionPath]}</p>
+                    </div>
+                    <div className="mt-3 grid gap-2 text-sm leading-6 text-slate-100 sm:grid-cols-2">
+                      <p>Режим микрофона: {audioProcessingDiagnostics.modeLabel}</p>
+                      <p>AEC: {audioProcessingDiagnostics.echoCancellationLabel}</p>
+                      <p>Шумоподавление: {audioProcessingDiagnostics.noiseSuppressionLabel}</p>
+                      <p>AGC: {audioProcessingDiagnostics.autoGainControlLabel}</p>
                     </div>
                     <p className="mt-3 text-xs leading-5 text-slate-300">
                       Этот блок нужен для поддержки и скрыт в обычном режиме.
@@ -2415,7 +2814,7 @@ export function SessionPage() {
                 )}
                 variant={localMediaState.audioEnabled ? "secondary" : "outline"}
                 onClick={handleToggleAudio}
-                disabled={Boolean(mediaAccessIssue)}
+                disabled={Boolean(mediaAccessIssue) || !hasLocalAudioTrack}
                 aria-label={localMediaState.audioEnabled ? "Выключить микрофон" : "Включить микрофон"}
                 title={localMediaState.audioEnabled ? "Выключить микрофон" : "Включить микрофон"}
               >
@@ -2431,7 +2830,7 @@ export function SessionPage() {
                 )}
                 variant={localMediaState.videoEnabled ? "secondary" : "outline"}
                 onClick={handleToggleVideo}
-                disabled={Boolean(mediaAccessIssue)}
+                disabled={Boolean(mediaAccessIssue) || !hasLocalVideoTrack}
                 aria-label={localMediaState.videoEnabled ? "Выключить камеру" : "Включить камеру"}
                 title={localMediaState.videoEnabled ? "Выключить камеру" : "Включить камеру"}
               >

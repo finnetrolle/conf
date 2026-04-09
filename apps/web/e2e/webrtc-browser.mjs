@@ -218,6 +218,137 @@ async function waitForConnected(page, label, expectedPath = null) {
   console.log(`${label}: connected via ${connectionPath}`)
 }
 
+async function openSettings(page) {
+  const closeSettingsButton = page.getByRole("button", { name: "Закрыть настройки" }).first()
+  if (await closeSettingsButton.isVisible().catch(() => false)) {
+    return
+  }
+
+  await page.getByRole("button", { name: "Показать настройки" }).click()
+  await closeSettingsButton.waitFor({ state: "visible", timeout: 5_000 })
+}
+
+async function closeSettings(page) {
+  const closeSettingsButton = page.getByRole("button", { name: "Закрыть настройки" }).first()
+  if (!(await closeSettingsButton.isVisible().catch(() => false))) {
+    return
+  }
+
+  await closeSettingsButton.click()
+  await closeSettingsButton.waitFor({ state: "hidden", timeout: 5_000 })
+}
+
+async function verifyEchoCancellationToggle(page, mode) {
+  await openSettings(page)
+
+  const toggle = page.getByTestId("echo-cancellation-toggle")
+  await toggle.waitFor({ state: "visible", timeout: 5_000 })
+  assert.match(
+    (await toggle.textContent())?.trim() ?? "",
+    /Выключено/,
+    `echo cancellation toggle should start disabled (${mode})`,
+  )
+
+  await toggle.click()
+  await page.waitForFunction(() => {
+    const toggleEl = document.querySelector("[data-testid='echo-cancellation-toggle']")
+    return toggleEl?.textContent?.includes("Включено")
+  }, undefined, { timeout: 10_000 })
+  await waitForStage(page, "Можно разговаривать", 10_000)
+
+  await toggle.click()
+  await page.waitForFunction(() => {
+    const toggleEl = document.querySelector("[data-testid='echo-cancellation-toggle']")
+    return toggleEl?.textContent?.includes("Выключено")
+  }, undefined, { timeout: 10_000 })
+
+  await closeSettings(page)
+  console.log(`echo cancellation toggle works (${mode})`)
+}
+
+async function verifyEchoCancellationFallback(page, mode) {
+  await page.evaluate(() => {
+    window.__echoCancellationApplyConstraintsFailures = 0
+    window.__echoCancellationOriginalApplyConstraints ??= MediaStreamTrack.prototype.applyConstraints
+
+    MediaStreamTrack.prototype.applyConstraints = async function(constraints) {
+      const originalApplyConstraints = window.__echoCancellationOriginalApplyConstraints
+      const echoCancellationConstraint =
+        constraints && typeof constraints === "object" ? constraints.echoCancellation : undefined
+
+      if (echoCancellationConstraint !== undefined && window.__echoCancellationApplyConstraintsFailures === 0) {
+        window.__echoCancellationApplyConstraintsFailures += 1
+        throw new DOMException("Synthetic echo cancellation failure", "OverconstrainedError")
+      }
+
+      return await originalApplyConstraints.call(this, constraints)
+    }
+  })
+
+  await openSettings(page)
+
+  const toggle = page.getByTestId("echo-cancellation-toggle")
+  await toggle.click()
+  await page.waitForFunction(() => {
+    const toggleEl = document.querySelector("[data-testid='echo-cancellation-toggle']")
+    return toggleEl?.textContent?.includes("Включено")
+  }, undefined, { timeout: 10_000 })
+  await page.waitForFunction(() => window.__echoCancellationApplyConstraintsFailures === 1, undefined, { timeout: 10_000 })
+  await waitForStage(page, "Можно разговаривать", 10_000)
+
+  const errorText = await page.evaluate(() => document.querySelector("[data-testid='session-error']")?.textContent ?? null)
+  assert.equal(errorText, null, `echo cancellation fallback should not surface a session error (${mode})`)
+
+  await toggle.click()
+  await page.waitForFunction(() => {
+    const toggleEl = document.querySelector("[data-testid='echo-cancellation-toggle']")
+    return toggleEl?.textContent?.includes("Выключено")
+  }, undefined, { timeout: 10_000 })
+
+  await closeSettings(page)
+  console.log(`echo cancellation fallback works (${mode})`)
+}
+
+async function verifyEchoCancellationUnavailableForCurrentTrack(page, mode) {
+  await page.evaluate(() => {
+    window.__echoCancellationOriginalGetCapabilities ??= MediaStreamTrack.prototype.getCapabilities
+
+    MediaStreamTrack.prototype.getCapabilities = function() {
+      const originalGetCapabilities = window.__echoCancellationOriginalGetCapabilities
+      const capabilities =
+        typeof originalGetCapabilities === "function" ? originalGetCapabilities.call(this) : {}
+
+      if (this.kind === "audio") {
+        return {
+          ...capabilities,
+          echoCancellation: [false],
+        }
+      }
+
+      return capabilities
+    }
+  })
+
+  await openSettings(page)
+
+  const toggle = page.getByTestId("echo-cancellation-toggle")
+  await toggle.click()
+  await page.getByText("Для текущего микрофона усиленное эхоподавление недоступно.").waitFor({
+    state: "visible",
+    timeout: 10_000,
+  })
+
+  assert.match(
+    (await toggle.textContent())?.trim() ?? "",
+    /Выключено/,
+    `echo cancellation toggle should stay disabled when the current track rejects enhancements (${mode})`,
+  )
+  await waitForStage(page, "Можно разговаривать", 10_000)
+
+  await closeSettings(page)
+  console.log(`echo cancellation unavailable capability guard works (${mode})`)
+}
+
 async function runScenario(browser, mode) {
   const created = await createSession()
   console.log(`created session ${created.sessionId} (${mode})`)
@@ -249,6 +380,10 @@ async function runScenario(browser, mode) {
       waitForConnected(hostPage, `host:${mode}`, expectedPath),
       waitForConnected(guestPage, `guest:${mode}`, expectedPath),
     ])
+
+    await verifyEchoCancellationToggle(hostPage, mode)
+    await verifyEchoCancellationFallback(hostPage, mode)
+    await verifyEchoCancellationUnavailableForCurrentTrack(hostPage, mode)
 
     assert.equal(
       await hostPage.getByRole("button", { name: "Отправить приглашение" }).isDisabled(),
